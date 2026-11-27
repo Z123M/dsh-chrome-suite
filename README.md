@@ -7,7 +7,7 @@
 
 ## 它是什么
 
-13 个 `browser_*` 工具常驻给模型用：
+17 个 `browser_*` 工具常驻给模型用：
 
 | 工具 | 能做什么 |
 |---|---|
@@ -99,8 +99,8 @@ Chrome 扩展面板里的「允许 DSH 控制浏览器」是人工开关，**只
     allowedActions: tabs,snapshot,read,screenshot,wait,devtools
 ```
 
-可用动作名：`tabs`、`tab-read`、`tab-write`、`snapshot`、`read`、`click`、`input`、`nav`、
-`screenshot`、`eval`、`wait`、`dialog`、`drag`、`download`、`devtools`。
+可用动作名：`tabs`、`tab-read`、`tab-write`、`snapshot`、`read`、`find`、`scrape`、`assert`、
+`click`、`input`、`nav`、`screenshot`、`eval`、`wait`、`dialog`、`drag`、`download`、`devtools`。
 `tab-read` 只允许列出和查找，`tab-write` 才允许开、关、切；`snapshot` 单独控制结构化快照。
 `browser_status` 不受白名单限制 —— 它是诊断工具，不碰网页内容。
 
@@ -108,7 +108,7 @@ Chrome 扩展面板里的「允许 DSH 控制浏览器」是人工开关，**只
 
 - **只借你正在用的 Chrome**：不新开 profile、不导入登录态，因为绝大多数要办的事都在已登录的页面里。
 - **不开调试端口**：Native Messaging + 扩展内 CDP，本机不监听 TCP；代价是需要装上这个扩展。
-- **13 个工具常驻**：模型不用先查工具清单再调用，代价是常驻工具描述占一点上下文。
+- **17 个工具常驻**：模型不用先查工具清单再调用，代价是常驻工具描述占一点上下文。
 - **保守的默认目标**：宁可报错要你指定标签页，也不猜；改错页面的代价远大于多输一个 id。
 
 ## 语言

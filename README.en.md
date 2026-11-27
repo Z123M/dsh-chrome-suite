@@ -8,7 +8,7 @@ Repository: https://github.com/Z123M/dsh-chrome-suite
 
 ## What it is
 
-13 resident `browser_*` tools for the model:
+17 resident `browser_*` tools for the model:
 
 | Tool | What it does |
 |---|---|
@@ -118,8 +118,8 @@ Everything is allowed by default. To narrow it, edit the profile's `cordis.patch
     allowedActions: tabs,snapshot,read,screenshot,wait,devtools
 ```
 
-Action names: `tabs`, `tab-read`, `tab-write`, `snapshot`, `read`, `click`, `input`, `nav`,
-`screenshot`, `eval`, `wait`, `dialog`, `drag`, `download`, `devtools`.
+Action names: `tabs`, `tab-read`, `tab-write`, `snapshot`, `read`, `find`, `scrape`, `assert`,
+`click`, `input`, `nav`, `screenshot`, `eval`, `wait`, `dialog`, `drag`, `download`, `devtools`.
 `tab-read` allows listing and finding only; `tab-write` allows open/close/activate; `snapshot`
 controls the structured snapshot separately. `browser_status` is exempt from the allowlist because it
 is a diagnostic tool that reads no page content.
@@ -130,7 +130,7 @@ is a diagnostic tool that reads no page content.
   doing lives in pages you are already signed in to.
 - **No debug port**: Native Messaging plus in-extension CDP, so nothing listens on TCP; the cost is
   that you have to install the extension.
-- **13 resident tools**: the model does not have to look up the tool list first; the cost is a little
+- **17 resident tools**: the model does not have to look up the tool list first; the cost is a little
   context spent on tool descriptions.
 - **Conservative default target**: erroring and asking for a tab id beats guessing, because acting on
   the wrong page costs far more than typing one id.

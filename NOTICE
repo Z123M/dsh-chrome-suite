@@ -38,6 +38,8 @@ installer in `setup.js`.
   allowlist was not passed to the check.
 - Resolves an omitted `tab` to a tab in the DSH work window when this session has not used one yet,
   so the plugin tools and the `cb` CLI share a default target.
+- Adds `browser_find`, `browser_scrape`, `browser_assert` and `browser_wait_response`, all built on the
+  existing `eval`/`network` operations, for a tool set of 17.
 - Adds records control: a popup button that clears the activity ledger, session ledger and log, a
   "record action details" switch that drops hints, tab titles and error text, and 24-hour caps on
   both the activity ledger and the log. Both controls are reachable only from the toolbar popup. The

@@ -18,7 +18,7 @@ whenToUse: 任务要在"用户已经登录的那个浏览器"里做事情，或�
 
 ## 首选：`browser_*` 原生工具
 
-装了 Chrome 浏览器套件就有这 13 个工具：
+装了 Chrome 浏览器套件就有这 17 个工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -34,6 +34,10 @@ whenToUse: 任务要在"用户已经登录的那个浏览器"里做事情，或�
 | `browser_dialog` | 放行 alert / confirm / prompt |
 | `browser_drag` | 拖拽：起点终点各用 `ref` / `selector` / `text` / 坐标；放置区一般没编号，用 `toText` |
 | `browser_download` | 下载文件：`ref` / `selector` / `url` 三选一，带用户的登录状态；默认存「下载」文件夹，`to=workdir` 存会话工作目录。下载按钮不是链接时，先点它，再从 `browser_devtools network` 里找文件网址 |
+| `browser_find` | 按可见文字或选择器找元素，**复用快照的编号**，返回的 ref 可直接喂给 click/input；比整页快照省上下文 |
+| `browser_scrape` | `item` + `fields` 抓表格/列表/卡片，直接拿结构化 JSON 行，不用整页文字自己解析 |
+| `browser_assert` | 断言页面状态：`text` / `selector` / `count` / `value` / `url` / `title`，失败带实际值；点完东西用它确认真的成功了 |
+| `browser_wait_response` | 等某个网络响应出现（可按 URL 子串/方法/状态码匹配，可连响应体一起取），比点击后盲等靠谱 |
 | `browser_devtools` | `console` 控制台 + JS 报错（`level=error` 只看报错）/ `network` 请求列表（`reload=true` 抓整页加载）/ `response` 看某个请求的返回内容 / `clear` |
 
 ## 备用：`cb` 命令行

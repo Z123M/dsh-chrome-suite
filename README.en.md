@@ -80,6 +80,27 @@ The "Allow DSH to control the browser" switch in the Chrome extension popup is a
   and the plugin does not expose it, so the model cannot let itself back in.
 - Pausing also detaches every attached tab. After that every action is refused until you resume.
 
+## Records and clearing them
+
+The extension keeps three ledgers: recent actions, conversations using the browser, and an extension
+log. **All in memory only, nothing on disk** — closing the extension or restarting Chrome clears them.
+
+- Automatic expiry: recent actions keep 24 hours / at most 80 entries; the log keeps 24 hours / at most 400 lines.
+- **Clear** next to "Recent actions" in the popup wipes all three ledgers but leaves controlled tabs
+  alone — those are real state, not records.
+- The **Record action details** switch: when off, only action names and timestamps are kept — no page
+  text, no tab titles, no error details, and hints in existing records are erased too.
+- Typed text is never recorded, only a word count.
+- **Only you can hit Clear or flip that switch**: nothing outside the toolbar popup (the model, the
+  `cb` CLI) can reach them, so the model cannot wipe its own traces.
+
+Host logs and the token live in `/tmp/chrome-suite-bridge-<uid>/` and can be deleted directly; they are
+recreated on the next start.
+
+**Out of scope for this plugin**: the DSH session history still keeps every tool call's arguments and
+results (merchant ids you looked up, page snapshots). To leave less behind, work in a fresh session or
+delete the session.
+
 ## Action allowlist
 
 Everything is allowed by default. To narrow it, edit the profile's `cordis.patch.yml` or set

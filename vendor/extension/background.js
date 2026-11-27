@@ -26,8 +26,16 @@ const attached = new Set()
 const loadWaiters = new Map()
 /** 分片接收缓冲：id → string[] */
 const inbox = new Map()
-/** SW 日志环（CLI 可读，免得去 chrome://extensions 开控制台） */
+/** SW 日志环（CLI 可读，免得去 chrome://extensions 开控制台）；条目带时间戳，按 24 小时 + 400 条双限 */
 const LOG = []
+const LOG_MAX = 400
+const LOG_TTL_MS = 24 * 3600e3
+
+/** 丢掉超过 24 小时的日志行 */
+function pruneLog(now = Date.now()) {
+  const cut = now - LOG_TTL_MS
+  while (LOG.length && LOG[0].at < cut) LOG.shift()
+}
 const CONSOLE = []
 /** 被 alert/confirm 挡住的标签页：tabId → {type, message} */
 const dialogs = new Map()
@@ -59,8 +67,10 @@ function log(...args) {
   const line = new Date().toISOString().slice(11, 19) + ' ' + args.map(a =>
     typeof a === 'string' ? a : (() => { try { return JSON.stringify(a) } catch { return String(a) } })()
   ).join(' ')
-  LOG.push(line)
-  if (LOG.length > 400) LOG.shift()
+  const at = Date.now()
+  LOG.push({ at, line })
+  if (LOG.length > LOG_MAX) LOG.shift()
+  pruneLog(at)
   console.log(line)
 }
 
@@ -225,10 +235,13 @@ async function touchesOwnPage(op, args) {
 let showCursor = true
 /** 用户关了「在单独窗口里干活」：新开的页回到用户当前窗口（后台标签页，不抢焦点） */
 let ownWindow = true
-const prefsReady = chrome.storage.local.get(['paused', 'showCursor', 'ownWindow']).then((v) => {
+/** 用户在弹窗里关了「记录操作明细」：最近操作只留动作名和时间，不留提示、标题、报错 */
+let recordDetail = true
+const prefsReady = chrome.storage.local.get(['paused', 'showCursor', 'ownWindow', 'recordDetail']).then((v) => {
   paused = !!(v && v.paused)
   showCursor = !(v && v.showCursor === false)
   ownWindow = !(v && v.ownWindow === false)
+  recordDetail = !(v && v.recordDetail === false)
   updateBadge()
 }).catch(() => {})
 
@@ -244,6 +257,20 @@ const SESSIONS = new Map()
 /** 最近动作：DSH 的一次工具调用算一条（同一个 callId 的多个 op 合并），cb 命令行一个 op 一条 */
 const ACTIVITY = []
 const ACTIVITY_MAX = 80
+const ACTIVITY_TTL_MS = 24 * 3600e3
+
+function pruneActivity(now = Date.now()) {
+  const cut = now - ACTIVITY_TTL_MS
+  while (ACTIVITY.length && ACTIVITY[0].last < cut) ACTIVITY.shift()
+}
+
+/** 用户在弹窗里清空记录：最近操作 + 日志 + 会话账本；受控标签页本身不动（那是真实状态，不是记录） */
+function clearRecords() {
+  ACTIVITY.length = 0
+  LOG.length = 0
+  SESSIONS.clear()
+  return { ok: true, at: Date.now() }
+}
 
 function clientKey(c) {
   if (!c) return 'cli'
@@ -293,11 +320,13 @@ function track(client, op, args, result, error, ms) {
     if (error) { prev.ok = false; prev.error = error }
     return
   }
+  // 关掉明细时：提示（可能带页面文字）、报错详情都不落，只留动作名、时间、耗时和成败
   ACTIVITY.push({
     at: now, last: now, key, call: call || null, tool: (client && client.tool) || null,
-    hint: (client && client.hint) || '', op: op === 'cdp' ? `cdp:${args.method}` : op,
-    tabId, ok: !error, error: error || undefined, ms, ops: 1,
+    hint: recordDetail ? (client && client.hint) || '' : '', op: op === 'cdp' ? `cdp:${args.method}` : op,
+    tabId, ok: !error, error: recordDetail ? (error || undefined) : undefined, ms, ops: 1,
   })
+  pruneActivity(now)
   if (ACTIVITY.length > ACTIVITY_MAX) ACTIVITY.shift()
 }
 
@@ -1256,7 +1285,8 @@ const OPS = {
     const st = await buildState()
     return {
       version: st.version, id: chrome.runtime.id, paused: st.paused, showCursor: st.showCursor,
-      ownWindow: st.ownWindow, attachedCount: st.attachedCount,
+      ownWindow: st.ownWindow, recordDetail: st.recordDetail, attachedCount: st.attachedCount,
+      activityCount: ACTIVITY.length,
       sessions: st.sessions.filter((x) => x.tabs.some((t) => t.attached)).length,
       tabs: [...st.sessions.flatMap((x) => x.tabs), ...st.orphans]
         .filter((t) => t.attached).slice(0, 8).map((t) => ({ title: t.title, url: t.url })),
@@ -1270,7 +1300,8 @@ const OPS = {
   },
 
   async logs({ limit = 60 } = {}) {
-    return { lines: LOG.slice(-limit) }
+    pruneLog()
+    return { lines: LOG.slice(-limit).map((e) => e.line) }
   },
 
   async console({ limit = 40, tabId, clear = false } = {}) {
@@ -1828,11 +1859,13 @@ async function buildState() {
     attachedCount: controlledCount(),
     showCursor,
     ownWindow,
+    recordDetail,
     sessions,
     orphans,
-    activity: ACTIVITY.slice(-30).reverse().map((a) => ({
-      ...a, title: a.tabId != null && tabInfo.has(a.tabId) ? tabInfo.get(a.tabId).title : '',
-    })),
+    activity: (pruneActivity(), ACTIVITY.slice(-30).reverse().map((a) => ({
+      ...a,
+      title: recordDetail && a.tabId != null && tabInfo.has(a.tabId) ? tabInfo.get(a.tabId).title : '',
+    }))),
   }
 }
 
@@ -1858,7 +1891,7 @@ async function diagnostics() {
       `  ${new Date(a.at).toTimeString().slice(0, 8)} ${a.tool || a.op} ${a.hint || ''} → ${a.error}`),
     '',
     '扩展日志（最近 30 行）：',
-    ...LOG.slice(-30).map((l) => `  ${l}`),
+    ...LOG.slice(-30).map((e) => `  ${e.line}`),
   ]
   return lines.join('\n')
 }
@@ -1898,6 +1931,19 @@ async function setOwnWindow(on, where) {
   log(`新开的页改成开在${ownWindow ? '单独窗口' : '当前窗口'}（${where}）`)
 }
 
+/** 关掉明细时顺手把已经记下的提示与报错擦掉，不然「关了开关但旧记录还在」说不通 */
+async function setRecordDetail(on) {
+  recordDetail = !!on
+  await chrome.storage.local.set({ recordDetail })
+  if (!recordDetail) {
+    for (const a of ACTIVITY) {
+      a.hint = ''
+      delete a.error
+    }
+  }
+  log(`记录操作明细：${recordDetail ? '打开' : '关掉'}`)
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.popup || sender.id !== chrome.runtime.id) return
   const run = async () => {
@@ -1928,6 +1974,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return buildState()
       case 'window':
         await setOwnWindow(!!msg.on, '弹窗')
+        return buildState()
+      case 'detail':
+        await setRecordDetail(!!msg.on)
+        return buildState()
+      case 'clearRecords':
+        // 清记录只在工具栏弹窗里给：这条通道 DSH 里的模型摸不到，免得它自己擦掉痕迹
+        if (sender.tab) throw new Error('清空记录只能在 Chrome 工具栏的 Chrome Suite Bridge 弹窗里点')
+        clearRecords()
         return buildState()
       case 'diagnostics':
         return { text: await diagnostics() }

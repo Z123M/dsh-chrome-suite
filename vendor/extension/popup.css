@@ -238,6 +238,7 @@ code { font: 500 12.5px var(--mono); letter-spacing: -0.2px; }
 .tile.orange { --t: var(--orange); }
 .tile.gray { --t: #8e8e93; }
 .tile.purple { --t: #af52de; }
+.tile.slate { --t: #5e6b7d; }
 .row[hidden] { display: none; }   /* .row 的 display:flex 会盖过 hidden */
 
 /* ── 系统开关 ── */

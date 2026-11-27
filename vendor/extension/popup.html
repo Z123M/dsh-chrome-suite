@@ -69,6 +69,12 @@
         <input type="checkbox" role="switch" data-act="window" checked>
         <span class="switch" aria-hidden="true"></span>
       </label>
+      <label class="row toggle">
+        <span class="tile slate" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.6h10v10.8H3z"/><path d="M5.4 6h5.2M5.4 8.6h5.2M5.4 11.2h3"/></svg></span>
+        <span class="row-main"><span class="row-title" data-i18n="detail">记录操作明细</span><span class="row-hint" data-i18n="detailHint">关掉后只记动作名和时间，不记页面文字</span></span>
+        <input type="checkbox" role="switch" data-act="detail" checked>
+        <span class="switch" aria-hidden="true"></span>
+      </label>
       <!-- 「允许访问文件网址」没开才显示：Chrome 默认关着，关着时 DSH 往网页里上传文件会失败（issue #7） -->
       <div class="row" id="fileRow" hidden>
         <span class="tile purple" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.8H4.6c-.9 0-1.6.7-1.6 1.6v9.2c0 .9.7 1.6 1.6 1.6h6.8c.9 0 1.6-.7 1.6-1.6V5.8z"/><path d="M9 1.8v4h4M8 12V8.2M6.3 9.8 8 8.1l1.7 1.7"/></svg></span>
@@ -89,6 +95,7 @@
   <section class="block">
     <div class="block-head">
       <h2 data-i18n="activity">最近操作</h2>
+      <button class="link" id="clearAct" type="button" data-act="clearRecords">清空</button>
       <button class="link" id="moreAct" type="button" hidden></button>
     </div>
     <ol id="activity" class="card list activity"></ol>

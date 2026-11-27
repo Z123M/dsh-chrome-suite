@@ -53,9 +53,16 @@ const I18N = {
     files: '上传文件',
     filesHint: '先打开「允许访问文件网址」',
     filesGo: '去打开',
+    detail: '记录操作明细',
+    detailHint: '关掉后只记动作名和时间，不记页面文字',
+    detailOn: '已打开明细记录',
+    detailOff: '已关掉明细记录，旧记录的提示也擦掉了',
     sessions: '正在用浏览器的对话',
     activity: '最近操作',
+    clearAct: '清空',
+    cleared: '记录已清空',
     releaseAll: '全部放开',
+    releaseAllOff: '现在没有受控标签页；空闲 %t 秒会自动放开',
     copyReport: '复制问题报告',
     extReady: '已就绪',
     hostOk: '正常',
@@ -144,9 +151,16 @@ const I18N = {
     files: 'File uploads',
     filesHint: 'Turn on "Allow access to file URLs" first',
     filesGo: 'Open',
+    detail: 'Record action details',
+    detailHint: 'Off: only action names and times, no page text',
+    detailOn: 'Action details are recorded',
+    detailOff: 'Details off; hints in old records cleared too',
     sessions: 'Conversations using the browser',
     activity: 'Recent actions',
+    clearAct: 'Clear',
+    cleared: 'Records cleared',
     releaseAll: 'Release all',
+    releaseAllOff: 'No controlled tab right now; released automatically after %t s of idling',
     copyReport: 'Copy report',
     extReady: 'Ready',
     hostOk: 'Running',
@@ -437,6 +451,9 @@ function renderSettings(st) {
   const win = document.querySelector('input[data-act="window"]')
   const ownWindow = st.ownWindow !== false
   if (win.checked !== ownWindow) win.checked = ownWindow
+  const detail = document.querySelector('input[data-act="detail"]')
+  const recordDetail = st.recordDetail !== false
+  if (detail.checked !== recordDetail) detail.checked = recordDetail
 }
 
 // ── 会话 ────────────────────────────────────────────────────────────────────
@@ -537,6 +554,8 @@ let showAllActivity = false
 function renderActivity(st) {
   const all = st.activity
   const items = showAllActivity ? all : all.slice(0, 6)
+  setText($('clearAct'), T('clearAct'))
+  $('clearAct').disabled = !all.length
   $('moreAct').hidden = all.length <= 6
   setText($('moreAct'), showAllActivity ? T('collapse') : T('showAll', { n: all.length }))
   if (!all.length) {
@@ -579,6 +598,9 @@ function render(st) {
   renderSessions(st)
   renderActivity(st)
   $('releaseAll').disabled = !st.attachedCount
+  $('releaseAll').title = st.attachedCount
+    ? T('releaseAll')
+    : T('releaseAllOff', { t: Math.round((st.idleMs || 60000) / 1000) })
 }
 
 async function ask(popup, extra = {}) {
@@ -634,6 +656,11 @@ document.addEventListener('click', async (ev) => {
       render(await ask('releaseAll'))
       toast(T('releasedAll'))
       break
+    case 'clearRecords':
+      render(await ask('clearRecords'))
+      showAllActivity = false
+      toast(T('cleared'))
+      break
     case 'fileAccess':
       // 扩展详情页：「允许访问文件网址」就在里面。切换后 Chrome 会重载扩展，这个弹窗也会跟着关掉
       chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` })
@@ -660,6 +687,9 @@ document.addEventListener('change', async (ev) => {
   } else if (input.dataset.act === 'window') {
     render(await ask('window', { on: input.checked }))
     toast(input.checked ? T('windowOn') : T('windowOff'))
+  } else if (input.dataset.act === 'detail') {
+    render(await ask('detail', { on: input.checked }))
+    toast(input.checked ? T('detailOn') : T('detailOff'))
   }
 })
 

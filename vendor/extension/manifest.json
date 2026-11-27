@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Suite Bridge",
+  "version": "1.15.3",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Chrome Suite Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwQ0ElX0e/IDztj7WVl+T7xaBcCYi1BoLM65H+5CLaBQ56ykcC/InCrs/M0j1DW5ykaYQwdYxhdJjZ+cMr/XGAjy9nWhHxhzNRz5NlwqidD82HCVwMKHmjcaWFwQkqXsi4ZKef8kPMmoXjVW6JTBR6ToChNQkKrlgOThMg55SQqTrRZOe1V2XkEqz3igGeJbY+/wLm4vayjjR8Y1M3AU2ZmQ8Qf4cb7zhBqOdBIM6aE9cYmd1g8BdZgUtJR31SarADjxocP1tei7rm7OyhHfy2Mjv5oMOs7yDEnQ1xPnJL6zy/zfROQZQV8JEleIF+RI05RoLTn4EVRm4PBafl3w9XwIDAQAB",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "scripting",
+    "tabGroups",
+    "alarms",
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

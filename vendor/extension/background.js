@@ -1,0 +1,1975 @@
+/**
+ * Chrome Suite Bridge — MV3 service worker
+ *
+ * 常驻连原生宿主（connectNative）。宿主由 Chrome 拉起，同时开一个 Unix socket
+ * 给 DSH 的 `cb` CLI 用，于是 DSH 就能像原生工具一样操作你正在用的 Chrome。
+ *
+ * 关键点：
+ *   - 不用点 Connect，装一次永久可用（service worker 自愈 + alarms 保活）
+ *   - 所有点击/输入都走 CDP Input.* → 真实事件（有 userGesture，弹窗不被拦）
+ *   - 大结果自动分片（native messaging 单条消息有上限）
+ */
+
+const HOST_NAME = 'com.chromesuite.bridge'
+const CDP_VERSION = '1.3'
+const RECONNECT_MS = 800
+const RECONNECT_MAX_MS = 30_000   // 宿主一直起不来（Node 没了、注册文件坏了）时，重连间隔指数退避到这里封顶
+const CHUNK_CHARS = 200 * 1024 // 单条 native 消息正文上限（保守取值）
+
+let port = null
+let connecting = false
+let retryMs = RECONNECT_MS
+
+/** 已 attach CDP 的 tabId */
+const attached = new Set()
+/** 正在等待 loadEventFired 的 tabId → resolve */
+const loadWaiters = new Map()
+/** 分片接收缓冲：id → string[] */
+const inbox = new Map()
+/** SW 日志环（CLI 可读，免得去 chrome://extensions 开控制台） */
+const LOG = []
+const CONSOLE = []
+/** 被 alert/confirm 挡住的标签页：tabId → {type, message} */
+const dialogs = new Map()
+/**
+ * 模型点了「上传」之类的按钮、页面要选文件：tabId → {id, owner, mode, backendNodeId, frameId, at, ready, doc, folder}。
+ * 那一下的系统选文件窗口已经拦下（不弹出来，DSH 也点不动它）；点击回话把 id 交给插件，
+ * 插件 upload 不给选择器时带着这个 id 来，文件就塞给这个框（只认点它的那个请求拿到的 id）。
+ * id 是随机串：扩展重载后从头来也不会和插件手里的旧 id 撞上。
+ */
+const choosers = new Map()
+/** 正在拦截的标签页：只在插件明确要求的那一下点击 / 按键里开，结束就关（用户自己点上传照常弹窗口） */
+const chooserArmed = new Set()
+/** 正开着拦截的那个请求：tabId → 随机串。拦下的框记在它名下，同一标签页的别的请求拿不到 */
+const chooserOwner = new Map()
+/** 同一标签页带拦截的点击 / 按键排队一个个来：两个会话同时点，不会把一个框算到两个请求头上 */
+const chooserLocks = new Map()
+/** 网页用的是拦不下来的那种选文件窗口（showOpenFilePicker 之类，拦了只会把它取消）：tabId → 时刻，这之后一阵不再拦 */
+const chooserSkip = new Map()
+const CHOOSER_TTL_MS = 10 * 60_000
+const CHOOSER_SKIP_MS = 5 * 60_000
+const CHOOSER_WAIT_MS = 100
+
+/** 网络请求环形缓冲（Network 域在 attach 时就 enable 了） */
+const NET = []
+const netPending = new Map()
+const NET_MAX = 400
+
+function log(...args) {
+  const line = new Date().toISOString().slice(11, 19) + ' ' + args.map(a =>
+    typeof a === 'string' ? a : (() => { try { return JSON.stringify(a) } catch { return String(a) } })()
+  ).join(' ')
+  LOG.push(line)
+  if (LOG.length > 400) LOG.shift()
+  console.log(line)
+}
+
+// ── 与原生宿主的连接 ────────────────────────────────────────────────────────
+
+function connect() {
+  if (port || connecting) return
+  connecting = true
+  try {
+    port = chrome.runtime.connectNative(HOST_NAME)
+  } catch (e) {
+    connecting = false
+    // 宿主清单只有 Chrome 启动时才载入：插件装好后若 Chrome 还没重启，这里会同步抛
+    // "Specified native messaging host not found"。以前直接 return，就再也不会自己好；
+    // 现在按退避继续重试，Chrome 重启后无需用户点任何东西。
+    log('connectNative 失败:', String(e))
+    setTimeout(connect, retryMs)
+    retryMs = Math.min(retryMs * 2, RECONNECT_MAX_MS)
+    return
+  }
+  connecting = false
+
+  port.onMessage.addListener((msg) => {
+    retryMs = RECONNECT_MS   // 宿主回过话才算真连上（connectNative 本身总是「成功」），退避清零
+    if (msg && msg.id && msg.chunk) {
+      const buf = inbox.get(msg.id) || []
+      buf[msg.chunk.seq] = msg.data
+      inbox.set(msg.id, buf)
+      if (buf.filter(Boolean).length >= msg.chunk.total) {
+        inbox.delete(msg.id)
+        try { handle(JSON.parse(buf.join(''))) } catch (e) { log('重组失败:', String(e)) }
+      }
+      return
+    }
+    handle(msg)
+  })
+
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError
+    if (err) log('原生宿主断开:', err.message)
+    port = null
+    hostInfo = null
+    for (const id of [...attached]) {
+      chrome.debugger.detach({ tabId: id }).catch(() => {})
+    }
+    attached.clear()
+    updateBadge()
+    setTimeout(connect, retryMs)
+    retryMs = Math.min(retryMs * 2, RECONNECT_MAX_MS)
+  })
+
+  log('已连上原生宿主')
+  // 主动报到：宿主靠它判断扩展是否在线（否则宿主刚起来时会误判"扩展未连接"）
+  post({ hello: true, version: chrome.runtime.getManifest().version })
+  post({ hostPing: true })
+  // connectNative 本身总是「成功」，宿主起不来要等 onDisconnect —— 稳住一会儿再把角标的 ! 收掉
+  setTimeout(() => { if (port) updateBadge() }, 1500)
+}
+
+function post(msg) {
+  if (!port) return false
+  try {
+    const s = JSON.stringify(msg)
+    if (s.length <= CHUNK_CHARS) {
+      port.postMessage(msg)
+      return true
+    }
+    const total = Math.ceil(s.length / CHUNK_CHARS)
+    for (let i = 0; i < total; i++) {
+      port.postMessage({ id: msg.id, chunk: { seq: i, total }, data: s.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS) })
+    }
+    return true
+  } catch (e) {
+    log('postMessage 失败:', String(e))
+    return false
+  }
+}
+
+/** 把 CDP 的英文报错翻成人能用的提示 */
+function friendly(e) {
+  const m = String((e && e.message) || e)
+  // 我们自己的报错（开头一个大写记号，插件按它换成各语言的话）原样过：FILE_ACCESS_OFF 里带着 chrome://extensions 地址
+  if (/^(FILE_ACCESS_OFF|NO_FILE_CHOOSER|MULTI_NOT_ALLOWED|USER_PICKED|FOLDER_INPUT) /.test(m)) return e
+  if (m.includes('chrome://') || m.includes('Cannot access a chrome')) {
+    return new Error('这个标签页是 chrome:// 内部页，浏览器禁止注入。用 cb tabs 挑一个 http/https 的标签页')
+  }
+  if (m.includes('No tab with id')) return new Error('标签页已经不存在了（可能被关掉了）')
+  if (m.includes('Another debugger is already attached') || m.includes('Cannot attach')) {
+    return new Error('这个标签页被别的调试器占着（多半是 DevTools 开着）——关掉 DevTools 再试')
+  }
+  if (m.includes('Detached while handling command') || m.includes('Debugger is not attached')) {
+    return new Error('这个标签页空闲被断开了（或页面刚导航过）——直接重试即可，会自动重连')
+  }
+  if (m.includes('Cannot find context with specified id')) return new Error('页面刚跳转过，执行上下文没了——重试一次')
+  if (m.includes('No dialog is showing')) return new Error('当前没有弹窗挡着（可能被 Chrome 推迟到标签页获得焦点时才弹）')
+  return e instanceof Error ? e : new Error(m)
+}
+
+async function handle(msg) {
+  if (!msg) return
+  if (msg.hostPong) { hostInfo = { ...msg, at: Date.now() }; return }
+  if (!msg.op) return
+  const { id, op, args = {}, client } = msg
+  const t0 = Date.now()
+  try {
+    const fn = OPS[op]
+    if (!fn) throw new Error(`未知操作: ${op}`)
+    await prefsReady   // worker 刚起来时先把「暂停」读出来，别让这段空档漏过去
+    if (!OWN_PAGE_OK.has(op) && (await touchesOwnPage(op, args))) {
+      throw new Error('扩展页面（chrome-extension://，包括 Chrome Suite Bridge 自己的弹窗页）不能被自动化操作')
+    }
+    if (paused && !PAUSE_ALLOWED.has(op)) throw new Error(PAUSED_MSG)
+    const result = await fn(args)
+    post({ id, ok: true, result })
+    track(client, op, args, result, null, Date.now() - t0)
+  } catch (e) {
+    const err = friendly(e).message
+    post({ id, ok: false, error: err })
+    track(client, op, args, null, err, Date.now() - t0)
+  }
+}
+
+// ── 弹窗用的账本：哪些会话在用、动了哪些标签页、最近做了什么 ────────────────
+// 全在内存里：service worker 有原生端口连着，平时不会被挂起；真重启了就从零记，不要紧。
+
+/** 宿主自报的状态（pid、socket 是否在听、最近一次被调用） */
+let hostInfo = null
+/** 用户在弹窗里按了暂停：除了这几个，其它操作一律拒绝 */
+let paused = false
+const PAUSE_ALLOWED = new Set(['version', 'reload', 'ping', 'logs', 'detach', 'panel'])
+const PAUSED_MSG = '用户在 Chrome Suite Bridge 弹窗里暂停了浏览器控制——请用户点开扩展图标、打开「允许 DSH 控制」后再试'
+
+/** 碰到扩展页面也允许的：只是松手 / 关掉，不往里注入、不发输入 */
+const OWN_PAGE_OK = new Set(['detach', 'close'])
+
+/**
+ * 这个网址是不是扩展页面：只看协议头（不分大小写）。URL 解析会吃掉的东西先去掉再比：
+ * 任何位置的 tab / 换行，开头的空白和控制字符。网址别处（查询串之类）出现 chrome-extension: 不算。
+ */
+const isExtUrl = (v) => typeof v === 'string' &&
+  /^chrome-extension:/i.test(v.replace(/[\t\n\r]/g, '').replace(/^[\x00-\x20]+/, ''))
+
+/**
+ * 扩展页面任何时候（不只是暂停时）都不让碰：弹窗页 popup.html 要是被当成标签页打开、再往里跑脚本，
+ * 就能 chrome.runtime.sendMessage 自己把「暂停」解除。打开、跳转过去、CDP 参数里带它、对它所在的
+ * 标签页做任何事（注入 / 截图 / 输入）都算。
+ */
+async function touchesOwnPage(op, args) {
+  if ((op === 'open' || op === 'nav') && isExtUrl(args.url)) return true
+  // CDP 只看网址类参数（Page.navigate、Target.createTarget 的 url 之类），不扫表达式等别的文本
+  const p = op === 'cdp' && args.params
+  if (p && typeof p === 'object' && Object.keys(p).some((k) => /url$/i.test(k) && isExtUrl(p[k]))) return true
+  if (args.tabId == null) return false
+  try {
+    const t = await chrome.tabs.get(Number(args.tabId))
+    return isExtUrl(t.url) || isExtUrl(t.pendingUrl)
+  } catch {
+    return false
+  }
+}
+/** 用户在弹窗里关了「页面里显示光标」：真实点击照做，只是不画那只蓝色光标 */
+let showCursor = true
+/** 用户关了「在单独窗口里干活」：新开的页回到用户当前窗口（后台标签页，不抢焦点） */
+let ownWindow = true
+const prefsReady = chrome.storage.local.get(['paused', 'showCursor', 'ownWindow']).then((v) => {
+  paused = !!(v && v.paused)
+  showCursor = !(v && v.showCursor === false)
+  ownWindow = !(v && v.ownWindow === false)
+  updateBadge()
+}).catch(() => {})
+
+/** 受控标签页里，扩展自己的页面（弹窗被当成网页打开时）不算数 */
+const controlledCount = () => [...attached].filter((id) => !ownTabs.has(id)).length
+
+/** 不算「动作」的内部操作（版本检查、焦点模拟、光标跟随……） */
+const QUIET_OPS = new Set(['version', 'reload', 'ping', 'logs', 'panel'])
+const QUIET_CDP = new Set(['Emulation.setFocusEmulationEnabled', 'Page.getNavigationHistory'])
+
+/** 会话 key → { key, kind, session, pid, first, last, ops, errors, tabs:Set } */
+const SESSIONS = new Map()
+/** 最近动作：DSH 的一次工具调用算一条（同一个 callId 的多个 op 合并），cb 命令行一个 op 一条 */
+const ACTIVITY = []
+const ACTIVITY_MAX = 80
+
+function clientKey(c) {
+  if (!c) return 'cli'
+  const kind = c.kind || 'dsh'
+  return c.session ? `${kind}:${c.session}` : `${kind}:pid${c.pid || '?'}`
+}
+
+/** 通过 open 打开的扩展自己的页面（弹窗页）：对它们的操作不记账 */
+const ownTabs = new Set()
+
+function track(client, op, args, result, error, ms) {
+  if (QUIET_OPS.has(op)) return
+  if (op === 'open' && String(args.url || '').startsWith(`chrome-extension://${chrome.runtime.id}/`)) {
+    if (result && result.tabId != null) ownTabs.add(Number(result.tabId))
+    return
+  }
+  if (args.tabId != null && ownTabs.has(Number(args.tabId))) return
+  // CDP 的原始报错是一段 JSON（{"code":-32000,"message":"…"}），弹窗里只留 message
+  if (error && error.trim().startsWith('{')) {
+    try { error = JSON.parse(error).message || error } catch {}
+  }
+  if (op === 'cdp' && QUIET_CDP.has(args.method)) return
+  const now = Date.now()
+  const key = clientKey(client)
+  let s = SESSIONS.get(key)
+  if (!s) {
+    s = { key, kind: client ? client.kind || 'dsh' : 'cli', session: (client && client.session) || null,
+      pid: (client && client.pid) || null, first: now, last: 0, ops: 0, errors: 0, tabs: new Set() }
+    SESSIONS.set(key, s)
+  }
+  s.last = now
+  s.ops++
+  if (error) s.errors++
+  const tabId = args.tabId != null ? Number(args.tabId) : result && result.tabId != null ? Number(result.tabId) : null
+  if (tabId != null) {
+    if (op === 'close') s.tabs.delete(tabId)
+    else s.tabs.add(tabId)
+  }
+
+  const call = client && client.call
+  const prev = call ? ACTIVITY.find((a) => a.call === call) : null
+  if (prev) {
+    prev.last = now
+    prev.ops++
+    prev.ms += ms
+    if (tabId != null && prev.tabId == null) prev.tabId = tabId
+    if (error) { prev.ok = false; prev.error = error }
+    return
+  }
+  ACTIVITY.push({
+    at: now, last: now, key, call: call || null, tool: (client && client.tool) || null,
+    hint: (client && client.hint) || '', op: op === 'cdp' ? `cdp:${args.method}` : op,
+    tabId, ok: !error, error: error || undefined, ms, ops: 1,
+  })
+  if (ACTIVITY.length > ACTIVITY_MAX) ACTIVITY.shift()
+}
+
+/** 工具栏图标角标：受控标签页数；暂停 ⏸；宿主断了 ! */
+function updateBadge() {
+  try {
+    const n = controlledCount()
+    let text = n ? String(n) : ''
+    let color = '#4D6BFE'
+    if (paused) { text = '⏸'; color = '#B7791F' } else if (!port) { text = '!'; color = '#E5484D' }
+    chrome.action.setBadgeText({ text })
+    chrome.action.setBadgeBackgroundColor({ color })
+    if (chrome.action.setBadgeTextColor) chrome.action.setBadgeTextColor({ color: '#FFFFFF' })
+  } catch {}
+}
+
+// ── CDP 基础设施 ────────────────────────────────────────────────────────────
+
+// 标签页最后被用到的时间 —— 空闲了就断开，别让 Chrome 一直挂着"正在调试"提示条
+const lastUsed = new Map()
+const DETACH_IDLE_MS = 60_000
+
+async function detachIdle() {
+  const now = Date.now()
+  for (const tabId of [...attached]) {
+    if (now - (lastUsed.get(tabId) || 0) < DETACH_IDLE_MS) continue
+    if (inflight.has(tabId)) continue          // 有 CDP 调用在飞（长 evaluate、截图…）
+    if (loadWaiters.has(tabId)) continue       // 正在等页面加载完成
+
+    try { await chrome.debugger.detach({ tabId }) } catch {}
+    attached.delete(tabId)
+    lastUsed.delete(tabId)
+    await unmarkTab(tabId)
+  }
+}
+
+// ── 正在被控制的标签页：自动分组 + 扩展图标上的 🖱 角标 ──────────────────────
+// 用户在标签栏上一眼就能看出"agent 正在动哪几个页面"，松手（空闲断开 / 显式 detach /
+// 关掉标签页 / 点掉 Chrome 那条调试提示）就自动还原，不留痕。
+
+// 用户看得见的两处文字（标签组名、工具栏图标的悬停提示）跟 Chrome 的界面语言走：zh* 中文、ru* 俄文、其它英文。
+// 认「我们的组」时几种语言的组名、以及老版本的「DSH agent 正在操作」都算，换了语言或升级后老组照样会被拆掉。
+const UI_LANG = (() => {
+  let l = ''
+  try { l = String(chrome.i18n.getUILanguage() || '').toLowerCase() } catch {}
+  return l.startsWith('zh') ? 'zh' : l.startsWith('ru') ? 'ru' : 'en'
+})()
+const GROUP_TITLES = { zh: 'DSH 正在操作', en: 'DSH at work', ru: 'DSH работает' }
+const GROUP_TITLE = GROUP_TITLES[UI_LANG]
+const OUR_GROUP_TITLES = new Set([...Object.values(GROUP_TITLES), 'DSH agent 正在操作'])
+const CURSOR_TAB_TITLE = {
+  zh: 'DSH 正在操作这个标签页（页面里有它的光标）',
+  en: 'DSH is working in this tab (its cursor is on the page)',
+  ru: 'DSH работает в этой вкладке (его курсор на странице)',
+}[UI_LANG]
+const CURSOR_ICON = { 16: 'icons/cursor16.png', 32: 'icons/cursor32.png', 48: 'icons/cursor48.png' }
+// 标签页上的小鼠标：把页面 favicon 临时换成它（data URL，绕开页面 CSP 与 web_accessible_resources）
+const CURSOR_FAVICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGUElEQVR4AbRWbWxUVRA9u9vutnQFFFNogZogIhFqqQnGEgiEEKIoJYoEP6pCTPhjoiJCGmKboBQqIWmAP5KYEKApWIRCoRSxlCpiUWIQGiiS8EMK/bBBoZZtl919z3Nudzfb7ZYQis297907M3fmzJl5t+vEwD8HRZK7wm/tNbl9+EOB4r26bt/unu/3+9dzllCZwikw/wuIeAAMlJ86fHha7bUOd6Hb7S60bdvX29srIG4CibenaGgj1qEyTO7urlhXexrYUmHjg1IbR38CPB7PGp/PJxAehtMZ2XI59CFnES90Os+TnJw8SwLL5tYGjvxoo+YUkJqauioQCJwA3kml3sVJAz6HOOIABJNJudNmYNuyYXHqXd1gYcXnFmpPu/Jse1d3uCQPhY1YAMzlrtOy4DAACAKcxADt9T500kJ1gx0pyXpg4ZAbNA4AMXDYisyoIQsICQSjkxloX1VvYVlREH+2p6yy7eo7YTYeuEETAlB8xgTjQ2tiMG+z1oaKDV+HUHXCirDxwA2aEACTZ7bkgSjUA+oFzcg6FJZ/ezyE/XXWkBo0IQBWgRk7wDhm2vwibHBPhW3zoTVl0gvE0k8DOFjvfKAGTQhAQZSloqv2eltsBjFg1owsRizWRG/ZVB4LovK7UKQk992ggwKgbw3AYubMWqBgsu7biwfpJAP1mpXHQijeFsTVG577btBBAPTV3woh2gvKNKjMiUTrCCNixQrLgmTpwpUQ1pbdxZ6jwQgbsQ1qcMc+EgKQgcUH/UKZMa6YpwTgPQHJojpKJZON5NBB9sieIyFU1ARjGtTcGQPiDRDQn7l4bDpSpkFGknNuYbLm3uhsEIxtZAYA2ZJ9hA29y6sDWLCiB3trkRcIHKijb92e/a7wxABoqWwUNPrmhrER3dMmAkxZU91fR71spSs/FMClq8681taOFylO4oyOxACYXWy9bdY2WmuiUKaqtxgxUzIzAQOK9uA0zNCXbJ592om0tGFzGFkAoiwkBGCQ01Lowc6HnHCCtbXCX4WRcW9kADZ+7MbGlW58yVm6ygPNTas92LTGg+M7hsHn6zk/YsSirfz/EQ3OY0gIQN+1UKvWkcyVmsmaKUpnkXPVWWxQJF/InuTEiJTWfY8Oa/tmlLd972Np7XtudZ4pPHPm10/S0uYtA3r/BQ4HjHH4kRAAmJkdyRz8M1kTOFnInqgjfWuxQC15B8oPB82ytbW1MStr+eZx45aWjh+/ZMPsWcVVeXnrDgDu68DPXTSSIT1xxSFvfPUfhgGbHc7UlK3pB9Z0ypMOfPFRMizJY/SyOd8cwoU/LOTm5hQAXe3AiGt9M/MGcLQDaLjFKH7OaHCuByuBVEyMpozFBTDlKSdKWGdpsrlWCQwDLIVkWu9it/Pn23PXr+9/AajpAWrvALt91Ctwv8wpMyMxA1SZeptvW/FtvPGyCy0tNypP/nCq+K1X2MiGAek4yY5YOXcphPOXLaSnp68G8pPphikImpncDhwJARhzHo0kp8xHpXVUZGUVlM2dU/z9hLG9TVPZcLIzDNEvsfIJ7KwKgL8rn29p+Wo+BUTK5z1GHACX7XTCnjLREa1zCWs+IbO3aezYxZsBfwvgbW1uvry9YGFfL+i/JgmAgKgXzl0K4nf2w+jRj68BlrgZOy4GJTEjTjks1Nx8ZftU1vjNBcnQt61svd7894EkNlbj30Do1vTpK+t1sWRPdsGwIIdhusTEjv19LACd+s3IT0YGiaczRkwX6f7c3A/r29v/2pk/x9/UdfPsaq/3tWWArxU4Fe7i2l4g0CWbdxclwVLqpCDEntBvRrDVfrvIh3EcUh/cNwBWfbcfSLuZkVFQ4vW+9PbMGYUHAR9pb7xJf9SZu5FJeu5kZCwuyyED0yYngQIYDVPIecaFbUWp6Ojo3AHcpYQn7zFiGZAZfdV0AyPbADe/40diMjchZEOnDfzERv4jFsrWejCN93zOZCe2FKUweAomPeFvGjPm9TLgEbIVPaezA2Y8ALIgEvfx263TtclA0NUpeeSw1uS4uysj49XNbW0d5Vs/S2XgVAbuvXi68ReWbd57QE8nUKfzso+cHfCOByADHWCWBrnWksVP6hsI0tWRmbm41OGYO9PhmD3b6120fOaMokNAEq/ds+qZAA8O5oMq4D8AAAD//zouHuEAAAAGSURBVAMAYX64YuQ3mpYAAAAASUVORK5CYII='
+const IDLE_ICON = { 16: 'icons/icon16.png', 32: 'icons/icon32.png', 48: 'icons/icon48.png' }
+const groupedTabs = new Map() // tabId -> groupId（只记我们自己建的组）
+const ourGroup = new Map()     // windowId -> groupId（标签组是 per-window 的）
+const tabEpoch = new Map()     // tabId -> 递增序号，用来发现"mark 与 unmark 撞车"
+
+/** 受控标签页的 favicon 换成小鼠标（松手还原）。页面导航后 favicon 自然复原，下次控制再补。 */
+async function setTabFavicon(tabId, on) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: Number(tabId) },
+      func: (on, href) => {
+        const ID = 'dsh-bridge-cursor-favicon'
+        const OFF = 'data-dsh-bridge-rel'
+        const old = document.getElementById(ID)
+        if (!on) {
+          // 把页面自己的图标 link 换回来（rel 改回去 Chrome 就会重算）；
+          // 页面一个都没写、靠默认 /favicon.ico 的，光删掉我们的 Chrome 不换回去 —— 补一个指向默认图标的
+          const parked = [...document.querySelectorAll(`link[${OFF}]`)]
+          if (!old && !parked.length) return
+          if (old) old.remove()
+          for (const l of parked) { l.rel = l.getAttribute(OFF); l.removeAttribute(OFF) }
+          if (!parked.length && !document.querySelector('link[rel~="icon"]')) {
+            const d = document.createElement('link')
+            d.rel = 'icon'
+            d.href = '/favicon.ico'
+            d.setAttribute('data-dsh-bridge', 'restore')
+            document.head.appendChild(d)
+          }
+          return
+        }
+        if (old) return
+        // 页面自己有图标的话 Chrome 会优先用它，我们的小鼠标挂不上去 —— 先把它们的 rel 停掉，松手时原样恢复
+        for (const l of document.querySelectorAll('link[rel~="icon"]')) {
+          l.setAttribute(OFF, l.rel)
+          l.rel = 'dsh-bridge-parked-icon'
+        }
+        const l = document.createElement('link')
+        l.id = ID
+        l.rel = 'icon'
+        l.type = 'image/png'
+        l.href = href
+        document.head.appendChild(l)
+      },
+      args: [on, CURSOR_FAVICON],
+    })
+  } catch {}
+}
+
+async function markTab(tabId) {
+  const id = Number(tabId)
+  tabEpoch.set(id, (tabEpoch.get(id) || 0) + 1)
+  updateBadge()
+  // 分组 = "这个标签页正在被操作"；标签上的小鼠标只跟页内光标走（markCursor）
+  await ensureGroup(id)
+}
+
+/**
+ * 同一个窗口里的受控标签页共用**同一个组**（不然同时操作 3 个标签页会出现 3 个同名蓝组）。
+ * 优先复用：内存里记的组 id → 按标题找本窗口现成的组 → 都没有才新建。
+ * 用户自己固定的、已经在用户自己分组里的标签页不动：分组会取消固定、把它挪出原来的组，松手时也还原不回去。
+ */
+async function ensureGroup(tabId) {
+  const id = Number(tabId)
+  if (groupedTabs.has(id)) return
+  let tab = null
+  try { tab = await chrome.tabs.get(id) } catch {}
+  if (!tab || tab.pinned) return
+  const wid = tab.windowId
+  if (tab.groupId >= 0) {
+    let g = null
+    try { g = await chrome.tabGroups.get(tab.groupId) } catch {}
+    if (!g || !OUR_GROUP_TITLES.has(g.title)) return   // 用户自己的组
+    groupedTabs.set(id, tab.groupId)            // 本来就在我们的组里（worker 重启过之类）
+    ourGroup.set(wid, tab.groupId)
+    return
+  }
+  const candidates = []
+  if (ourGroup.has(wid)) candidates.push(ourGroup.get(wid))
+  try {
+    // 只找本窗口的：按标题跨窗口复用，会把标签页拽到别的窗口去
+    for (const g of await chrome.tabGroups.query({ windowId: wid })) {
+      if (OUR_GROUP_TITLES.has(g.title) && !candidates.includes(g.id)) candidates.push(g.id)
+    }
+  } catch {}
+  for (const gid of candidates) {
+    try {
+      if ((await chrome.tabGroups.get(gid)).windowId !== wid) continue   // 记着的组被拖去了别的窗口
+      await chrome.tabs.group({ tabIds: [id], groupId: gid })
+      groupedTabs.set(id, gid)
+      ourGroup.set(wid, gid)
+      await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: 'blue' })
+      return
+    } catch {}
+  }
+  try {
+    // 新建的组一定要指明在它自己的窗口：不写的话 Chrome 建在「当前窗口」，会把别的窗口里的标签页（比如干活窗口里的）拽过来
+    const gid = await chrome.tabs.group({ tabIds: [id], createProperties: { windowId: wid } })
+    groupedTabs.set(id, gid)
+    ourGroup.set(wid, gid)
+    await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: 'blue' })
+  } catch (e) {
+    console.log('[dsh-bridge] 分组失败（不影响干活）:', String(e && e.message || e))
+  }
+}
+
+async function unmarkTab(tabId) {
+  const id = Number(tabId)
+  const epoch = tabEpoch.get(id) || 0      // 竞态守卫：await 期间如果有新的 mark，就放弃这次 unmark
+  updateBadge()
+  cursorReady.delete(id)      // 必修：不清的话，松手后小鼠标灭了就再也不亮（页面里的光标其实还在）
+  cursorPos.delete(id)        // 松手后再接手，光标从新目标处冒出来，不从老地方飞
+  await hidePageCursor(id)    // 尽力把页内光标收掉（松手不留痕）
+  await markCursor(id, false)
+  if ((tabEpoch.get(id) || 0) !== epoch) return   // 期间又被 mark 了，别拆
+  if (!groupedTabs.has(id)) return
+  const gid = groupedTabs.get(id)
+  groupedTabs.delete(id)
+  try {
+    // 用户中途把它拖进了自己的组：那是用户的组，别拆
+    if ((await chrome.tabs.get(id)).groupId === gid) await chrome.tabs.ungroup([id])
+  } catch {}
+}
+
+/**
+ * 自愈：service worker 会被 Chrome 随时挂起、扩展重载也会清掉内存里的分组表，
+ * 但 Chrome 那边的组是持久的。所以启动时对一遍账：
+ *   · 还挂着调试会话的标签页 → 认领回分组表（继续归我们管）
+ *   · 已经没会话、却还留在我们组里的（几种语言的组名、老版本的组名都算）→ 拆掉还原（别留孤儿组和残留角标）
+ */
+async function reconcileGroups() {
+  try {
+    const groups = (await chrome.tabGroups.query({})).filter((g) => OUR_GROUP_TITLES.has(g.title))
+    if (!groups.length) return
+    let attachedIds = new Set()
+    try {
+      const targets = await chrome.debugger.getTargets()
+      attachedIds = new Set(targets.filter(t => t.attached && t.tabId != null).map(t => t.tabId))
+    } catch {}
+    for (const g of groups) {
+      const tabs = await chrome.tabs.query({ groupId: g.id })
+      for (const t of tabs) {
+        if (attachedIds.has(t.id)) {
+          groupedTabs.set(t.id, g.id)
+          if (t.windowId != null) ourGroup.set(t.windowId, g.id)
+        } else if (!attached.has(t.id)) {   // 重新确认一次：启动瞬间并发进来的 op 别被误拆
+          groupedTabs.set(t.id, g.id)       // 先认领，unmarkTab 才会真的去拆
+          await unmarkTab(t.id)
+        }
+      }
+    }
+  } catch (e) {
+    console.log('[dsh-bridge] 分组对账失败（不影响干活）:', String(e && e.message || e))
+  }
+}
+
+// ── DSH 自己的干活窗口 ──────────────────────────────────────────────────────
+
+/**
+ * 新开的页默认放进一个单独的 Chrome 窗口：同一个用户资料，登录状态都在，但不往用户正在用的窗口里塞标签页。
+ * 窗口在后台开（不抢焦点），之后新开的页都进它；用户把它关了，下次再开一个。
+ * 普通和隐身各用各的：用户正在隐身窗口里，新页就开进隐身的干活窗口，不把隐身的事带进普通的 Cookie 和历史记录（反过来也一样）。
+ * 窗口 id 记在 storage.session：worker 被挂起再起来还认得；浏览器重启就清空（id 也变了）。
+ */
+const agentWindows = { normal: null, incognito: null }
+/** DSH 在干活窗口里开的标签页：用户自己拖进来的页不算，不能把它切走 */
+const agentTabs = new Set()
+const agentWindowReady = chrome.storage.session.get(['agentWindows', 'agentTabs']).then((v) => {
+  Object.assign(agentWindows, (v && v.agentWindows) || {})
+  for (const id of (v && v.agentTabs) || []) agentTabs.add(id)
+}).catch(() => {})
+
+function saveAgentWindows() {
+  chrome.storage.session.set({ agentWindows: { ...agentWindows }, agentTabs: [...agentTabs] }).catch(() => {})
+}
+
+function forgetAgentWindow(id) {
+  let changed = false
+  for (const k of Object.keys(agentWindows)) if (agentWindows[k] === id) { agentWindows[k] = null; changed = true }
+  if (changed) saveAgentWindows()
+}
+
+/** 这一种（normal / incognito）的干活窗口还在就回它的 id，没了（被关掉、浏览器重启过）回 null */
+async function agentWindow(mode) {
+  await agentWindowReady
+  const id = agentWindows[mode]
+  if (id == null) return null
+  try {
+    const w = await chrome.windows.get(id)
+    if (w && w.type === 'normal' && !!w.incognito === (mode === 'incognito')) return w.id
+  } catch {}
+  forgetAgentWindow(id)
+  return null
+}
+
+/** 现在还在的干活窗口（两种都算），列标签页时标出来用 */
+async function agentWindowIds() {
+  return new Set((await Promise.all(['normal', 'incognito'].map(agentWindow))).filter((id) => id != null))
+}
+
+/** 开页排队：两个会话同时开页时，后来的等前一个开完（窗口建好了）再往里加，不另开第二个窗口 */
+let agentWindowQueue = Promise.resolve()
+
+function openInAgentWindow(url) {
+  const run = agentWindowQueue.then(() => openInAgentWindowNow(url))
+  agentWindowQueue = run.catch(() => {})
+  return run
+}
+
+function rememberAgentTab(t) {
+  agentTabs.add(t.id)
+  saveAgentWindows()
+  return t
+}
+
+async function openInAgentWindowNow(url) {
+  // 用户最后在用的普通窗口：隐身与否跟它走，新窗口的大小也照它
+  let cur = null
+  try { cur = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }) } catch {}
+  const incognito = !!(cur && cur.incognito)
+  const mode = incognito ? 'incognito' : 'normal'
+  const wid = await agentWindow(mode)
+  if (wid != null) {
+    try {
+      // 窗口里正显示的是 DSH 开的页就切到新页（偷看一眼就是最新的）；不动窗口焦点。
+      // 正显示的是用户自己拖进来的页：别把它切走，新页在后台开
+      const [shown] = await chrome.tabs.query({ windowId: wid, active: true })
+      return rememberAgentTab(await chrome.tabs.create({ windowId: wid, url, active: !shown || agentTabs.has(shown.id) }))
+    } catch (e) {
+      // 刚好在这一下被关掉了：下面重开一个。窗口还在就是别的错（比如网址不让开），照实报
+      if (await chrome.windows.get(wid).then(() => true, () => false)) throw e
+      forgetAgentWindow(wid)
+    }
+  }
+  // 跟用户当前窗口一样大、错开一点；最大化 / 全屏的不照抄，交给 Chrome 默认
+  const props = { url, focused: false, type: 'normal', incognito }
+  let w
+  if (cur && cur.state === 'normal' && cur.width && cur.height) {
+    try {
+      w = await chrome.windows.create({ ...props, left: cur.left + 40, top: cur.top + 40, width: cur.width, height: cur.height })
+    } catch {}   // 窗口贴着屏幕边，错开以后一半到了屏幕外，Chrome 不让开：交给它自己摆
+  }
+  if (!w) w = await chrome.windows.create(props)
+  agentWindows[mode] = w.id
+  return rememberAgentTab(w.tabs[0])
+}
+
+async function ensure(tabId) {
+  if (paused) throw new Error(PAUSED_MSG)   // 暂停中不再接管任何标签页（进行中的操作也不会重新 attach）
+  lastUsed.set(Number(tabId), Date.now())
+  if (!attached.has(tabId)) {
+    try {
+      await chrome.debugger.attach({ tabId: Number(tabId) }, CDP_VERSION)
+    } catch (e) {
+      if (!String(e && e.message || e).includes('Already attached')) throw e
+    }
+    attached.add(Number(tabId))
+    // Runtime.enable 会把接上之前的 console 和 JS 报错补发一遍（V8 自己存着），Log.enable 同理补发浏览器日志
+    for (const d of ['Page', 'DOM', 'Runtime', 'Network', 'Log']) {
+      try { await chrome.debugger.sendCommand({ tabId: Number(tabId) }, d + '.enable', {}) } catch {}
+    }
+    // 后台标签页 / 被挡住的窗口里页面是 hidden，不开焦点模拟的话 CDP 鼠标键盘事件会被直接丢掉
+    try { await chrome.debugger.sendCommand({ tabId: Number(tabId) }, 'Emulation.setFocusEmulationEnabled', { enabled: true }) } catch {}
+    await markTab(tabId)
+  }
+  return Number(tabId)
+}
+
+/**
+ * 「允许访问文件网址」开没开：Chrome 默认关；关着时 DOM.setFileInputFiles 只回一句 Not allowed（issue #7）。
+ * 用户在扩展详情里切换这个开关，Chrome 会把扩展整个重载，所以这里不用缓存也不会过期。
+ */
+async function fileAccess() {
+  try { return await chrome.extension.isAllowedFileSchemeAccess() } catch { return null }
+}
+
+function fileAccessError() {
+  const url = `chrome://extensions/?id=${chrome.runtime.id}`
+  return new Error(`FILE_ACCESS_OFF ${url} 扩展没开「允许访问文件网址」，Chrome 不让它把电脑上的文件塞进网页：在 ${url} 打开「允许访问文件网址」，扩展会自动重载，几秒后再上传`)
+}
+
+/**
+ * 插件明确要求时（点击 / 按键带 chooser: true），在发鼠标 / 键盘事件之前调：这一下要是让页面打开系统的选文件窗口，
+ * 就拦下来记进 choosers。没开文件访问时不拦（拦了也塞不进去，不如让窗口照常弹出来给用户自己选）。
+ * 老插件、cb 命令行不带这个标记，一律不拦。返回这次开没开成。
+ */
+async function armChooser(tabId) {
+  const id = Number(tabId)
+  if ((await fileAccess()) !== true) return false
+  const skip = chooserSkip.get(id)
+  if (skip && Date.now() - skip < CHOOSER_SKIP_MS) return false
+  try {
+    // 每次都发：主动松手 / 空闲断开 / 宿主重连以后调试会话是新的，旧会话里开的拦截已经没了
+    await chrome.debugger.sendCommand({ tabId: id }, 'Page.setInterceptFileChooserDialog', { enabled: true })
+  } catch { return false }
+  chooserArmed.add(id)
+  return true
+}
+
+/** 这一下点击 / 按键做完就关拦截：之后页面（或用户自己）再打开选文件窗口，照常弹出来 */
+async function disarmChooser(tabId) {
+  const id = Number(tabId)
+  if (!chooserArmed.delete(id)) return
+  try { await chrome.debugger.sendCommand({ tabId: id }, 'Page.setInterceptFileChooserDialog', { enabled: false }) } catch {}
+}
+
+/** 这个请求（token）拦下的框，回给插件的那一份；等它查完是不是选文件夹、属于哪个文档 */
+async function chooserFor(tabId, token) {
+  const id = Number(tabId)
+  const c = choosers.get(id)
+  if (!c || c.owner !== token) return undefined
+  await c.ready
+  if (choosers.get(id) !== c) return undefined
+  if (!c.backendNodeId) return { unsupported: true }
+  if (c.folder) { dropChooser(id, c); return { folder: true } }
+  return { id: c.id, mode: c.mode }
+}
+
+/** 等 Page.fileChooserOpened 的：tabId → resolve */
+const chooserWaiters = new Map()
+
+/**
+ * Page.fileChooserOpened 在松开鼠标的回包之后才到（本机无头 Chrome 实测紧跟着、0 毫秒）：拦截开着时等一小会儿，
+ * 来了马上走；页面没要选文件就等满 ms。
+ */
+async function waitChooser(tabId, token, ms = CHOOSER_WAIT_MS) {
+  const id = Number(tabId)
+  const has = () => { const c = choosers.get(id); return !!c && c.owner === token }
+  if (has() || !chooserArmed.has(id)) return
+  await new Promise((resolve) => {
+    const tm = setTimeout(done, ms)
+    function done() { clearTimeout(tm); if (chooserWaiters.get(id) === done) chooserWaiters.delete(id); resolve() }
+    chooserWaiters.set(id, done)
+  })
+}
+
+/** 某个框所在文档的 loaderId（找不到这个框就用主框架的）：换过页就对不上 */
+async function docOf(tabId, frameId, sendFn) {
+  try {
+    const { frameTree } = await sendFn(tabId, 'Page.getFrameTree', {})
+    let main = null
+    const walk = (t) => {
+      if (!t || !t.frame) return null
+      if (!t.frame.parentId) main = main || t.frame
+      if (t.frame.id === frameId) return t.frame
+      for (const ch of t.childFrames || []) { const f = walk(ch); if (f) return f }
+      return null
+    }
+    const f = walk(frameTree) || main
+    return f ? `${f.id}:${f.loaderId}` : null
+  } catch { return null }
+}
+
+/** DOM.describeNode 回来的节点有没有某个属性 */
+function hasAttr(node, name) {
+  const a = (node && node.attributes) || []
+  for (let i = 0; i < a.length; i += 2) if (String(a[i]).toLowerCase() === name) return true
+  return false
+}
+
+/** DOM.describeNode 回来的节点某个属性的值（没有回 null） */
+function attrValue(node, name) {
+  const a = (node && node.attributes) || []
+  for (let i = 0; i < a.length; i += 2) if (String(a[i]).toLowerCase() === name) return String(a[i + 1])
+  return null
+}
+
+/** 节点是不是「选文件夹」的框（webkitdirectory：塞普通文件进去，Chrome 会当目录去枚举，什么也传不上） */
+function isFolderNode(node) { return hasAttr(node, 'webkitdirectory') }
+
+/** 放开对拦下那个框的引用（见 inspectChooser 的 hold） */
+function releaseHold(tabId, c) {
+  if (!c || !c.hold) return
+  try { chrome.debugger.sendCommand({ tabId: Number(tabId) }, 'Runtime.releaseObjectGroup', { objectGroup: c.hold }).catch(() => {}) } catch {}
+}
+
+/** 删掉这个标签页拦下的框（给了 c 就只在还是这一条时删），顺手放开引用 */
+function dropChooser(tabId, c) {
+  const id = Number(tabId)
+  const cur = choosers.get(id)
+  if (!cur || (c && cur !== c)) return
+  choosers.delete(id)
+  releaseHold(id, cur)
+}
+
+/**
+ * 文件框现在的样子：还在不在页面上、里面已有哪些文件、拦下以后有没有人自己点开 / 选过（watch 时装上记数）。
+ * 记数挂在节点上的 key 下：拦下那一下的点击早过去了，之后再有 click / change 就是别人（用户、页面）动过它。查不到回 null
+ */
+async function inputState(tabId, backendNodeId, sendFn, key, watch = false) {
+  const objectGroup = `dsh-chooser-${crypto.randomUUID()}`
+  try {
+    const { object } = await sendFn(tabId, 'DOM.resolveNode', { backendNodeId, objectGroup })
+    const { result } = await sendFn(tabId, 'Runtime.callFunctionOn', {
+      objectId: object.objectId, returnByValue: true, arguments: [{ value: key }, { value: watch }],
+      functionDeclaration: `function (k, watch) {
+        const el = this
+        if (watch) { el[k] = 0; for (const t of ['click', 'change']) el.addEventListener(t, () => { el[k]++ }, true) }
+        return { on: el.isConnected, touched: typeof el[k] === 'number' ? el[k] : -1,
+          files: [...(el.files || [])].map((f) => f.name + '/' + f.size + '/' + f.lastModified).join('|') }
+      }`,
+    })
+    return (result && result.value) || null
+  } catch { return null } finally {
+    Promise.resolve().then(() => sendFn(tabId, 'Runtime.releaseObjectGroup', { objectGroup })).catch(() => {})
+  }
+}
+
+/** 拦下框以后马上查：是不是「选文件夹」，属于哪个文档，框里原来有哪些文件 */
+async function inspectChooser(tabId, c) {
+  const raw = (_t, method, params) => chrome.debugger.sendCommand({ tabId }, method, params)
+  if (c.backendNodeId) {
+    // 先抓住这个框：很多网站在点击函数里现造一个 input、不插进页面也不留引用，拦下以后没人拿着它，
+    // 模型想文件的工夫浏览器一回收就没了（实测强制回收后上传报「没在等」）。用完 / 换掉 / 换页 / 断开时放开
+    c.hold = `dsh-hold-${c.id}`
+    try { await raw(tabId, 'DOM.resolveNode', { backendNodeId: c.backendNodeId, objectGroup: c.hold }) } catch {}
+    try {
+      const { node } = await raw(tabId, 'DOM.describeNode', { backendNodeId: c.backendNodeId })
+      c.folder = isFolderNode(node)
+    } catch {}
+    c.state = await inputState(tabId, c.backendNodeId, raw, c.key, true)
+  }
+  c.doc = await docOf(tabId, c.frameId, raw)
+  if (choosers.get(tabId) !== c) releaseHold(tabId, c)   // 查的工夫已经被新框顶掉 / 换页了
+}
+
+/**
+ * 插件要求时，把一下点击 / 按键包在拦截里：排队 → 开 → 做 → 等一小会儿看页面要不要选文件 → 关。
+ * 回 { ...做的结果, fileChooser }（没要选文件就没有这个字段）。
+ */
+async function withChooser(tabId, want, fn) {
+  if (!want) return fn()
+  const id = Number(tabId)
+  const prev = chooserLocks.get(id) || Promise.resolve()
+  let release
+  const mine = new Promise((r) => { release = r })
+  const chain = prev.then(() => mine)
+  chooserLocks.set(id, chain)
+  await prev
+  const token = crypto.randomUUID()
+  let r
+  try {
+    chooserOwner.set(id, token)
+    await armChooser(id)
+    r = await fn()
+    await waitChooser(id, token)
+  } finally {
+    await disarmChooser(id)   // 关拦截的回包到了，之前拦下的 Page.fileChooserOpened 也都到了
+    if (chooserOwner.get(id) === token) chooserOwner.delete(id)
+    release()
+    if (chooserLocks.get(id) === chain) chooserLocks.delete(id)
+  }
+  const fileChooser = await chooserFor(id, token)
+  return fileChooser ? { ...r, fileChooser } : r
+}
+
+// 正在执行的 CDP 调用计数：空闲断开不能把"正干着活"的标签页掐了
+const inflight = new Map()
+
+/** 慢的 CDP 命令单独放宽：整页 / 大页面截图 15 秒常常不够 */
+const CDP_TIMEOUT_MS = { 'Page.captureScreenshot': 60_000 }
+
+async function send(tabId, method, params, timeoutMs = CDP_TIMEOUT_MS[method] || 15000) {
+  const id = Number(tabId)
+  // 每条命令前都重查暂停：用户中途按了暂停，进行中的点击 / 输入不再往下发
+  if (paused) throw new Error(PAUSED_MSG)
+  // 必修：以前只有 evaluate 之前才 ensure，key/hover/scroll/dialog 这些直接 send 的 op
+  // 在空闲松手后永远失败。统一在这里 ensure：既能自动重连，也顺带刷新 lastUsed。
+  await ensure(id)
+  inflight.set(id, (inflight.get(id) || 0) + 1)
+  const p = chrome.debugger.sendCommand({ tabId: id }, method, params || {})
+  try {
+    // 兜底：任何 CDP 命令都不该把 op 挂死（历史上 mouseWheel 就不回包）
+    return await Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`CDP ${method} ${Math.round(timeoutMs / 1000)} 秒没回应`)), timeoutMs)),
+    ])
+  } finally {
+    const n = (inflight.get(id) || 1) - 1
+    if (n <= 0) inflight.delete(id); else inflight.set(id, n)
+  }
+}
+
+/**
+ * 发出去、不要求回包的 CDP 命令。
+ * 实测：Input.dispatchMouseEvent 的 mouseWheel 在 Chrome 155 上**事件生效但不回包**，
+ * 用 send() 等回复会把 scroll 挂死（客户端 45 秒超时）。这里等一小会儿就走。
+ */
+async function sendNoReply(tabId, method, params, graceMs = 1500) {
+  const id = Number(tabId)
+  if (paused) throw new Error(PAUSED_MSG)
+  await ensure(id)
+  inflight.set(id, (inflight.get(id) || 0) + 1)
+  try {
+    await Promise.race([
+      chrome.debugger.sendCommand({ tabId: id }, method, params || {}).catch(() => {}),
+      new Promise((res) => setTimeout(res, graceMs)),
+    ])
+  } finally {
+    const n = (inflight.get(id) || 1) - 1
+    if (n <= 0) inflight.delete(id); else inflight.set(id, n)
+  }
+}
+
+/** 等页面加载的标签页关掉了 / 调试器断开了：立刻让 nav 失败，别白等到超时、还报「已到」 */
+function failLoadWaiter(tabId, why) {
+  const w = loadWaiters.get(tabId)
+  if (!w) return
+  loadWaiters.delete(tabId)
+  clearTimeout(w.timer)
+  w.reject(new Error(why))
+}
+
+chrome.debugger.onDetach.addListener((src, reason) => {
+  if (src && src.tabId != null) {
+    failLoadWaiter(src.tabId, reason === 'target_closed' ? '标签页在加载中被关掉了' : '等页面加载时调试器被断开了（多半是点掉了 Chrome 的调试提示条）')
+    attached.delete(src.tabId)
+    lastUsed.delete(src.tabId)
+    chooserArmed.delete(src.tabId)   // 拦截跟着调试会话没了；拦下的那个框（choosers）不用删，节点 id 换会话照样认
+    unmarkTab(src.tabId).catch((e) => log('unmark 失败:', String(e && e.message || e)))   // 用户点掉调试提示也算松手
+  }
+})
+
+chrome.debugger.onEvent.addListener((src, method, params) => {
+  if (method === 'Page.loadEventFired') {
+    cursorReady.delete(src.tabId)
+    markCursor(src.tabId, false).catch(() => {})   // 导航后页内光标没了，标签上的小鼠标跟着灭
+    const w = loadWaiters.get(src.tabId)
+    if (w) { loadWaiters.delete(src.tabId); clearTimeout(w.timer); w.resolve() }
+  }
+  if (method === 'Page.javascriptDialogOpening') {
+    dialogs.set(src.tabId, { type: params.type, message: params.message, at: Date.now() })
+  }
+  if (method === 'Page.javascriptDialogClosed') {
+    dialogs.delete(src.tabId)
+  }
+  if (method === 'Page.fileChooserOpened') {
+    // 没有 backendNodeId：不是 <input type=file>（showOpenFilePicker 这类），拦下来等于给网页取消了，也塞不进去。
+    // 记下来回话里说清楚，这个标签页之后一阵不再拦，模型再点一次就会照常弹出系统窗口
+    if (!params.backendNodeId) chooserSkip.set(src.tabId, Date.now())
+    const c = {
+      id: crypto.randomUUID(), key: `__dshPick_${Date.now()}_${Math.random().toString(36).slice(2)}`, owner: chooserOwner.get(src.tabId), mode: params.mode,
+      backendNodeId: params.backendNodeId || null, frameId: params.frameId || null, at: Date.now(),
+    }
+    releaseHold(src.tabId, choosers.get(src.tabId))   // 同一标签页新框顶掉旧框
+    c.ready = inspectChooser(src.tabId, c)
+    choosers.set(src.tabId, c)
+    const w = chooserWaiters.get(src.tabId)
+    if (w) w()
+  }
+  if (method === 'Page.frameNavigated' && params.frame && !params.frame.parentId) {
+    dropChooser(src.tabId)   // 换页了，原来那个文件框也没了
+    chooserSkip.delete(src.tabId)
+  }
+  if (method === 'Network.requestWillBeSent') {
+    // WebSocket/SSE 这类连接永不 finished，netPending 得有个上限（NET 有 400，它原来没有）
+    if (netPending.size > NET_MAX) {
+      const oldest = netPending.keys().next().value
+      netPending.delete(oldest)
+    }
+    netPending.set(params.requestId, {
+      id: params.requestId, tabId: src.tabId, method: params.request.method, url: params.request.url,
+      type: params.type, at: Date.now(),
+    })
+  }
+  if (method === 'Network.responseReceived') {
+    const p = netPending.get(params.requestId)
+    if (p) { p.status = params.response.status; p.mime = params.response.mimeType }
+  }
+  if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+    const p = netPending.get(params.requestId)
+    if (p) {
+      p.ms = Date.now() - p.at
+      if (method === 'Network.loadingFailed') p.failed = params.errorText
+      NET.push(p)
+      if (NET.length > NET_MAX) NET.shift()
+      netPending.delete(params.requestId)
+    }
+  }
+  if (method === 'Runtime.consoleAPICalled') {
+    const args = params.args || []
+    const f = params.stackTrace && params.stackTrace.callFrames && params.stackTrace.callFrames[0]
+    const item = { tabId: src.tabId, level: params.type, kind: 'console', text: args.map(fmtArg).join(' '),
+      at: params.timestamp, where: f && f.url ? `${f.url}:${f.lineNumber + 1}` : '' }
+    // 调试器接上前打的旧消息是 V8 补发的，补发不带对象预览（只剩 "Object"）——回页面里展开一下
+    if (pushConsole(item) && args.some(needsExpand)) {
+      expandArgs(src.tabId, args).then((t) => { item.text = t.slice(0, 2000) }).catch(() => {})
+    }
+  }
+  if (method === 'Runtime.exceptionThrown') {
+    // 没被 catch 的 JS 报错 —— 调试网页时最要紧的一类，console API 那条路收不到
+    const d = params.exceptionDetails || {}
+    pushConsole({ tabId: src.tabId, level: 'error', kind: 'exception',
+      text: (d.exception && (d.exception.description || d.exception.value)) || d.text || 'Uncaught',
+      at: params.timestamp, where: d.url ? `${d.url}:${(d.lineNumber || 0) + 1}` : '' })
+  }
+  if (method === 'Log.entryAdded') {
+    // 浏览器自己报的：请求失败、CSP 拦截、废弃 API 警告……
+    const e = params.entry || {}
+    if (e.level !== 'verbose') {
+      pushConsole({ tabId: src.tabId, level: e.level, kind: e.source || 'browser', text: e.text || '',
+        at: e.timestamp, where: e.url || '' })
+    }
+  }
+})
+
+/** console 参数 → 一段字。对象/数组用 V8 带的预览拼成 {a: 1, b: "x"}，不然只看得到 "Object"。 */
+function fmtArg(a) {
+  if (a.value !== undefined) return typeof a.value === 'string' ? a.value : JSON.stringify(a.value)
+  if (a.unserializableValue) return a.unserializableValue
+  const p = a.preview
+  if (p && p.properties && (p.subtype === 'array' || (p.type === 'object' && !p.subtype))) {
+    const val = (x) => (x.type === 'string' ? JSON.stringify(x.value) : x.value ?? x.type)
+    const more = p.overflow ? ', …' : ''
+    return p.subtype === 'array'
+      ? `[${p.properties.map(val).join(', ')}${more}]`
+      : `{${p.properties.map((x) => `${x.name}: ${val(x)}`).join(', ')}${more}}`
+  }
+  return a.description || a.type
+}
+
+const needsExpand = (a) => a.objectId && !a.preview && a.type === 'object' && (!a.subtype || a.subtype === 'array')
+
+/** 页内把对象拼成和预览一样的样子：{a: 1, b: "x"} / [1, 2] */
+const EXPAND_FN = `function () {
+  const v = (x) => typeof x === 'string' ? JSON.stringify(x) : x === null ? 'null'
+    : Array.isArray(x) ? 'Array(' + x.length + ')'
+    : typeof x === 'object' ? ((x.constructor && x.constructor.name) || 'Object')
+    : typeof x === 'function' ? 'ƒ' : String(x);
+  if (Array.isArray(this)) return '[' + this.slice(0, 20).map(v).join(', ') + (this.length > 20 ? ', …' : '') + ']';
+  const ks = Object.keys(this);
+  return '{' + ks.slice(0, 20).map((k) => k + ': ' + v(this[k])).join(', ') + (ks.length > 20 ? ', …' : '') + '}';
+}`
+
+async function expandArgs(tabId, args) {
+  const parts = []
+  for (const a of args) {
+    if (!needsExpand(a)) { parts.push(fmtArg(a)); continue }
+    try {
+      const r = await chrome.debugger.sendCommand({ tabId }, 'Runtime.callFunctionOn',
+        { objectId: a.objectId, functionDeclaration: EXPAND_FN, returnByValue: true, silent: true })
+      parts.push(r && r.result && typeof r.result.value === 'string' ? r.result.value : fmtArg(a))
+    } catch {
+      parts.push(fmtArg(a))
+    }
+  }
+  return parts.join(' ')
+}
+
+/** 重新 attach 时 V8 会把旧消息补发一遍 —— 按「标签页 + 时间 + 内容」去重。 */
+function pushConsole(item) {
+  item.text = String(item.text || '').slice(0, 2000)
+  item.at = Math.round(Number(item.at) || Date.now())
+  item.key = item.text   // 去重按原始文字比：text 之后可能被 expandArgs 改写
+  const dup = CONSOLE.some(c => c.tabId === item.tabId && c.at === item.at && c.key === item.key)
+  if (dup) return false
+  CONSOLE.push(item)
+  if (CONSOLE.length > 300) CONSOLE.shift()
+  return true
+}
+
+/**
+ * 注入表达式并取值（有异常就抛，别把 undefined 当成功）。
+ * userGesture 只给要它的（模型自己的 eval）：读页面、找元素、画光标都不带，不白送页面一次「用户激活」。
+ */
+async function evaluate(tabId, expression, userGesture = false) {
+  await ensure(tabId)
+  const r = await send(tabId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+    userGesture: !!userGesture,
+  })
+  if (r.exceptionDetails) {
+    const d = r.exceptionDetails
+    throw new Error((d.exception && (d.exception.description || d.exception.value)) || d.text || '页面 JS 抛异常')
+  }
+  return r.result ? r.result.value : undefined
+}
+
+/** 页内找一个元素的中点（顺带滚动到可视区），返回视口坐标 */
+const POINT_HELPER = `
+const __dsh_norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+const __dsh_visible = (el) => {
+  const r = el.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return false;
+  const st = getComputedStyle(el);
+  if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) return false;
+  return true;
+};
+const __dsh_point = (el) => {
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  return new Promise((res) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      const r = el.getBoundingClientRect();
+      res({ x: r.left + r.width / 2, y: r.top + r.height / 2,
+            tag: el.tagName.toLowerCase(),
+            // 输入框没 innerText，退到 aria-label / placeholder；密码框的 value 绝不拿出来（会上名牌、进工具结果）
+            text: __dsh_norm(el.innerText || (el.type === 'password' ? '' : el.value) || el.getAttribute('aria-label') ||
+              el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || '').slice(0, 80) });
+    };
+    // 后台标签页里 Chrome 会暂停 requestAnimationFrame —— 只等 rAF 的话这个 Promise
+    // 永远不 resolve，整个 click-el / click-text 就卡死（45 秒超时、还不回话）。
+    // 所以 rAF 之外再挂一个定时器兜底。
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+    setTimeout(finish, 120);
+  });
+};
+`
+
+async function pointOf(tabId, finderJs) {
+  const pt = await evaluate(tabId, `(async () => { ${POINT_HELPER} ${finderJs} })()`)
+  if (!pt) throw new Error('没找到目标元素（可能不可见或文字不匹配）')
+  return pt
+}
+
+/** 页内光标：注入过一次就记住，导航后失效要重注；位置按标签页记着，换了页面从原处接着出现 */
+const cursorReady = new Set()
+const cursorPos = new Map()
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function injectCursor(tabId, script) {
+  if (!script || !showCursor) return false
+  const id = Number(tabId)
+  if (!cursorReady.has(id)) {
+    await evaluate(tabId, script)
+    const p = cursorPos.get(id)
+    if (p) await evaluate(tabId, `window.__dshCursor.pos() || window.__dshCursor.place(${p.x}, ${p.y})`).catch(() => {})
+    cursorReady.add(id)
+    // 语义：标签页上出现小鼠标 = 这个页面里真的有一只鼠标（页内光标已就位）
+    await markCursor(tabId, true)
+  }
+  return true
+}
+
+/**
+ * 调页内光标。cursorReady 可能已经过期（页面刚跳走、loadEventFired 还没到；或者页面里还是旧版光标），
+ * 所以表达式里先探一下 v3 光标在不在，不在就重注一次再来。光标装不上返回 undefined。
+ */
+async function cursorDo(tabId, script, expr) {
+  const id = Number(tabId)
+  const NONE = '__dsh_no_cursor__'
+  const probe = `((window.__dshCursor && window.__dshCursor.version >= 3) ? (${expr}) : ${JSON.stringify(NONE)})`
+  if (!cursorReady.has(id) && !(await injectCursor(tabId, script))) return undefined
+  let r = await evaluate(tabId, probe)
+  if (r === NONE) {
+    cursorReady.delete(id)
+    if (!(await injectCursor(tabId, script))) return undefined
+    r = await evaluate(tabId, probe)
+  }
+  return r === NONE ? undefined : r
+}
+
+/** 光标滑到 (x, y)，可顺带亮出名牌文字。返回滑行时长 ms；光标装不上返回 null（不影响真实操作）。 */
+async function cursorMove(tabId, script, x, y, opts = {}) {
+  const px = Math.round(Number(x))
+  const py = Math.round(Number(y))
+  const mo = { straight: !!opts.straight }
+  if (opts.duration != null) mo.duration = Math.max(0, Math.round(Number(opts.duration)))
+  const say = opts.label ? `c.label(${JSON.stringify(String(opts.label).slice(0, 80))});` : ''
+  try {
+    const d = await cursorDo(tabId, script, `(() => { const c = window.__dshCursor; ${say} return c.move(${px}, ${py}, ${JSON.stringify(mo)}) })()`)
+    if (d === undefined) return null
+    cursorPos.set(Number(tabId), { x: px, y: py })
+    return Number(d) || 0
+  } catch { return null }
+}
+
+/** 光标的其它表情（click / down / up / label / scroll）：只在光标已经在页面里时做，出错不管 */
+async function cursorFx(tabId, expr) {
+  if (!cursorReady.has(Number(tabId))) return undefined
+  try { return await cursorDo(tabId, '', expr) } catch { return undefined }
+}
+
+/** 等光标飞到位：人眼先看到"要点这儿"，再发真实事件 */
+const settle = (d) => sleep(Math.min(700, Math.max(120, d || 0)) + 40)
+
+/** 用 scripting 在 MAIN world 收掉页内光标（不依赖 CDP，调试器已断开时也能收）。 */
+async function hidePageCursor(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: Number(tabId) },
+      world: 'MAIN',
+      func: () => { try { window.__dshCursor && window.__dshCursor.hide() } catch {} },
+    })
+  } catch {}
+}
+
+/** 标签上的小鼠标只跟"页内光标在不在"：在 → 亮；hide / 导航 / 松手 → 灭。 */
+async function markCursor(tabId, on) {
+  const id = Number(tabId)
+  try {
+    await chrome.action.setIcon({ tabId: id, path: on ? CURSOR_ICON : IDLE_ICON })
+    await chrome.action.setTitle({ tabId: id, title: on ? CURSOR_TAB_TITLE : '' })
+  } catch {}
+  await setTabFavicon(id, on)
+}
+
+async function clickPoint(tabId, x, y, opts = {}) {
+  const n = Number(opts.clickCount || 1)
+  const button = opts.button || 'left'
+  const base = { x: Math.round(x), y: Math.round(y), button, clickCount: n }
+
+  // 先让光标飞过去，人眼看得见，再发真实点击
+  if (opts.cursor && opts.cursor.script) {
+    const d = await cursorMove(tabId, opts.cursor.script, base.x, base.y, { label: opts.cursor.label })
+    if (d !== null) {
+      await settle(d)
+      await cursorFx(tabId, `(window.__dshCursor.click(${base.x}, ${base.y}, ${n}), 1)`)
+    }
+  }
+
+  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved', buttons: 0 })
+  await new Promise(r => setTimeout(r, 12))
+  return withChooser(tabId, opts.chooser, async () => {
+    await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 })
+    await new Promise(r => setTimeout(r, 24))
+    await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 })
+    return { x: base.x, y: base.y, button }
+  })
+}
+
+const MODS = { alt: 1, ctrl: 2, meta: 4, shift: 8 }
+const NAMED_KEYS = {
+  enter: ['Enter', 'Enter', 13, '\r'], tab: ['Tab', 'Tab', 9], escape: ['Escape', 'Escape', 27],
+  esc: ['Escape', 'Escape', 27], backspace: ['Backspace', 'Backspace', 8],
+  delete: ['Delete', 'Delete', 46], arrowup: ['ArrowUp', 'ArrowUp', 38], arrowdown: ['ArrowDown', 'ArrowDown', 40],
+  arrowleft: ['ArrowLeft', 'ArrowLeft', 37], arrowright: ['ArrowRight', 'ArrowRight', 39],
+  home: ['Home', 'Home', 36], end: ['End', 'End', 35], pageup: ['PageUp', 'PageUp', 33],
+  pagedown: ['PageDown', 'PageDown', 34], space: [' ', 'Space', 32, ' '],
+}
+
+async function pressKey(tabId, spec) {
+  const parts = String(spec).split('+').map(s => s.trim()).filter(Boolean)
+  const keyName = parts.pop()
+  let modifiers = 0
+  for (const p of parts) {
+    const m = MODS[p.toLowerCase()]
+    if (!m) throw new Error(`不认识修饰键: ${p}（可用 alt/ctrl/meta/shift）`)
+    modifiers |= m
+  }
+  const lower = keyName.toLowerCase()
+  let key, code, keyCode, text
+  if (NAMED_KEYS[lower]) {
+    ;[key, code, keyCode, text] = NAMED_KEYS[lower]
+  } else if (keyName.length === 1) {
+    key = keyName
+    keyCode = keyName.toUpperCase().charCodeAt(0)
+    code = /[a-z]/i.test(keyName) ? 'Key' + keyName.toUpperCase()
+         : /[0-9]/.test(keyName) ? 'Digit' + keyName
+         : ''
+    text = keyName
+  } else {
+    throw new Error(`不认识按键: ${keyName}`)
+  }
+  const suppressText = modifiers !== 0 || !text
+  const base = { key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers }
+  await send(tabId, 'Input.dispatchKeyEvent', {
+    ...base, type: suppressText ? 'rawKeyDown' : 'keyDown',
+    ...(suppressText ? {} : { text, unmodifiedText: text }),
+  })
+  await new Promise(r => setTimeout(r, 12))
+  await send(tabId, 'Input.dispatchKeyEvent', { ...base, type: 'keyUp' })
+  return { key: spec, modifiers }
+}
+
+// ── 操作表 ──────────────────────────────────────────────────────────────────
+
+const OPS = {
+  async ping() {
+    return { pong: true, at: Date.now(), attached: [...attached] }
+  },
+
+  async version() {
+    return { version: chrome.runtime.getManifest().version, id: chrome.runtime.id }
+  },
+
+  /**
+   * DSH 插件设置页用：读状态、暂停、开关光标、全部松手。
+   * 只开放「更安全」的方向：这条通道 DSH 里的模型也摸得到（cb / socket），
+   * 所以「恢复控制」不给 —— 那一下只能用户在 Chrome 的扩展面板里点。
+   */
+  async panel({ action = 'state', on } = {}) {
+    if (action === 'pause') {
+      if (!on) throw new Error('恢复控制只能在 Chrome 工具栏的 Chrome Suite Bridge 面板里打开')
+      await setPaused(true, 'DSH 设置页')
+    } else if (action === 'cursor') {
+      await setShowCursor(!!on, 'DSH 设置页')
+    } else if (action === 'window') {
+      await setOwnWindow(!!on, 'DSH 设置页')
+    } else if (action === 'releaseAll') {
+      await releaseAllTabs()
+    } else if (action !== 'state') {
+      throw new Error(`panel 不认识的 action: ${action}`)
+    }
+    const st = await buildState()
+    return {
+      version: st.version, id: chrome.runtime.id, paused: st.paused, showCursor: st.showCursor,
+      ownWindow: st.ownWindow, attachedCount: st.attachedCount,
+      sessions: st.sessions.filter((x) => x.tabs.some((t) => t.attached)).length,
+      tabs: [...st.sessions.flatMap((x) => x.tabs), ...st.orphans]
+        .filter((t) => t.attached).slice(0, 8).map((t) => ({ title: t.title, url: t.url })),
+    }
+  },
+
+  /** 改完扩展代码：拷文件 → cb reload，不用去 chrome://extensions 点刷新 */
+  async reload() {
+    setTimeout(() => chrome.runtime.reload(), 250)
+    return { reloading: true }
+  },
+
+  async logs({ limit = 60 } = {}) {
+    return { lines: LOG.slice(-limit) }
+  },
+
+  async console({ limit = 40, tabId, clear = false } = {}) {
+    if (clear) {
+      for (let i = CONSOLE.length - 1; i >= 0; i--) {
+        if (tabId == null || CONSOLE[i].tabId === Number(tabId)) CONSOLE.splice(i, 1)
+      }
+      return { cleared: true }
+    }
+    const items = tabId != null ? CONSOLE.filter(c => c.tabId === Number(tabId)) : CONSOLE
+    return { items: items.slice(-limit) }
+  },
+
+  async tabs() {
+    const tabs = await chrome.tabs.query({})
+    // 窗口不止一个时每个窗口都有一个 active：focused 标出用户最后在用的那个窗口，agentWindow 标出 DSH 的干活窗口
+    let focusedWin = null
+    try { focusedWin = (await chrome.windows.getLastFocused()).id } catch {}
+    const agentWins = await agentWindowIds()
+    // 刚开、服务器还没回第一个字节的页 url 是空的，要去的地址在 pendingUrl：不算上的话，刚开的慢页列不出来，
+    // 不传 tab 接着操作它也会报「没指定标签页」
+    return tabs
+      .map(t => ({ t, url: t.url || t.pendingUrl || '' }))
+      .filter(({ url }) => url && !url.startsWith('chrome-extension://'))
+      .map(({ t, url }) => ({
+        id: t.id, windowId: t.windowId, active: t.active, pinned: t.pinned,
+        focused: t.windowId === focusedWin, agentWindow: agentWins.has(t.windowId),
+        title: t.title, url, attached: attached.has(t.id),
+        // 这个标签页是不是被我们自动分进「🖱 DSH agent」组（面板和自检都用得上）
+        grouped: groupedTabs.has(t.id), groupId: t.groupId >= 0 ? t.groupId : null,
+      }))
+  },
+
+  async attach({ tabId }) {
+    await ensure(tabId)
+    return { tabId: Number(tabId), attached: true }
+  },
+
+  async detach({ tabId }) {
+    failLoadWaiter(Number(tabId), '等页面加载时被松手了')   // 自己 detach 不会触发 onDetach，这里补上
+    try { await chrome.debugger.detach({ tabId: Number(tabId) }) } catch {}
+    attached.delete(Number(tabId))
+    lastUsed.delete(Number(tabId))
+    await unmarkTab(tabId)
+    return { tabId: Number(tabId), attached: false }
+  },
+
+  async activate({ tabId }) {
+    const t = await chrome.tabs.get(Number(tabId))
+    await chrome.tabs.update(Number(tabId), { active: true })
+    await chrome.windows.update(t.windowId, { focused: true })
+    return { tabId: Number(tabId), windowId: t.windowId }
+  },
+
+  async open({ url, active = false }) {
+    // 相对地址会被 tabs.create 按扩展自己的地址补全（example.com → chrome-extension://…/example.com），只收完整网址
+    if (url) { try { new URL(url) } catch { throw new Error(`要给完整网址（带 https://）：${url}`) } }
+    // 默认开进 DSH 自己的窗口（后台，不抢焦点）；用户关了「单独窗口」就在当前窗口后台开页。
+    // 两种都不顶掉用户正在看的标签页。active=true（cb open --front）是有意要它跳到眼前，照旧开在当前窗口
+    if (ownWindow && !active) {
+      const t = await openInAgentWindow(url)
+      return { tabId: t.id, url: t.pendingUrl || t.url || url || '', window: 'agent' }
+    }
+    const t = await chrome.tabs.create({ url, active: !!active })
+    return { tabId: t.id, url: t.url }
+  },
+
+  async close({ tabId }) {
+    await chrome.tabs.remove(Number(tabId))
+    return { closed: Number(tabId) }
+  },
+
+  async eval({ tabId, expression, userGesture = true }) {
+    return { value: await evaluate(tabId, expression, userGesture !== false) }
+  },
+
+  async cdp({ tabId, method, params }) {
+    await ensure(tabId)
+    if (method === 'Page.navigateToHistoryEntry') {
+      // 后退 / 前进到历史里的扩展页面也算「导航到扩展页面」
+      const h = await send(tabId, 'Page.getNavigationHistory')
+      const e = (h.entries || []).find((x) => x.id === (params || {}).entryId)
+      if (e && isExtUrl(e.url)) throw new Error('扩展页面（chrome-extension://）不能被自动化操作')
+    }
+    return { result: await send(tabId, method, params || {}) }
+  },
+
+  async nav({ tabId, url, wait = true, timeoutMs = 30000 }) {
+    const id = await ensure(tabId)
+    // 加载完 → loaded=true；超时 → loaded=false（照样返回，调用方提示「还没加载完」）；
+    // 标签页关了 / 调试器断了 → failLoadWaiter 直接让它失败
+    let entry = null
+    const p = wait ? new Promise((resolve, reject) => {
+      entry = { resolve: () => resolve(true), reject, timer: null }
+      entry.timer = setTimeout(() => { if (loadWaiters.get(id) === entry) loadWaiters.delete(id); resolve(false) }, timeoutMs)
+      loadWaiters.set(id, entry)
+    }) : null
+    let r
+    try {
+      r = await send(id, 'Page.navigate', { url })
+    } catch (e) {
+      if (entry) { clearTimeout(entry.timer); if (loadWaiters.get(id) === entry) loadWaiters.delete(id) }
+      throw e
+    }
+    const loaded = p ? await p : null
+    const t = await chrome.tabs.get(id).catch(() => null)
+    return { url: (t && t.url) || url, title: t && t.title, frameId: r.frameId, waited: !!wait, loaded }
+  },
+
+  async click({ tabId, x, y, clickCount, button, script, chooser }) {
+    return clickPoint(tabId, x, y, { clickCount, button, chooser, cursor: { script, label: `点击 (${Math.round(x)}, ${Math.round(y)})` } })
+  },
+
+  async clickEl({ tabId, selector, script, chooser }) {
+    const pt = await pointOf(tabId, `
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      let target = el;
+      const r0 = el.getBoundingClientRect();
+      if (r0.width < 1 || r0.height < 1) {
+        const inner = [...el.querySelectorAll('*')].find(__dsh_visible);
+        if (inner) target = inner;
+      }
+      if (!__dsh_visible(target) && !target.getBoundingClientRect().width) return null;
+      return __dsh_point(target);
+    `)
+    const hit = await clickPoint(tabId, pt.x, pt.y, { chooser, cursor: { script, label: `点击 ${pt.text || pt.tag}` } })
+    return { ...hit, target: pt }
+  },
+
+  async clickText({ tabId, text, exact = true, index = 0, script, chooser }) {
+    const pt = await pointOf(tabId, `
+      const want = __dsh_norm(${JSON.stringify(text)});
+      const SEL = 'a,button,input,textarea,select,label,summary,[role=button],[role=link],[role=tab],[role=menuitem],[onclick],[contenteditable=true],li,td,th,h1,h2,h3,h4,span,div,p';
+      const all = [...document.querySelectorAll(SEL)].filter(__dsh_visible);
+      const label = (el) => __dsh_norm(el.innerText || (el.type === 'password' ? '' : el.value) || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '');
+      let hit = all.filter((el) => label(el) === want);
+      if (!hit.length && ${exact ? 'false' : 'true'}) hit = all.filter((el) => label(el).includes(want));
+      if (!hit.length) return null;
+      hit.sort((a, b) => { const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect(); return ra.width * ra.height - rb.width * rb.height; });
+      const el = hit[Math.min(${Number(index) || 0}, hit.length - 1)];
+      // 元素框常常比可见按钮大得多（<a> 里塞满空白），点框中心会落在按钮外面。
+      // 所以先找承载这段文字的文本节点，用 Range 拿它的**精确**位置。
+      const textRect = (root, needle) => {
+        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = w.nextNode())) {
+          const t = __dsh_norm(n.nodeValue || '');
+          if (!t) continue;
+          if (t === needle || t.includes(needle)) {
+            const rg = document.createRange();
+            rg.selectNodeContents(n);
+            const rc = rg.getBoundingClientRect();
+            if (rc.width > 0 && rc.height > 0) return rc;
+          }
+        }
+        return null;
+      };
+      const tr = textRect(el, want);
+      if (tr) {
+        const pr = el.getBoundingClientRect();
+        return { x: Math.round(tr.x + tr.width / 2), y: Math.round(tr.y + tr.height / 2),
+                 text: (el.innerText || '').trim().slice(0, 60), tag: el.tagName.toLowerCase(),
+                 rect: [Math.round(pr.x), Math.round(pr.y), Math.round(pr.width), Math.round(pr.height)],
+                 textRect: [Math.round(tr.x), Math.round(tr.y), Math.round(tr.width), Math.round(tr.height)] };
+      }
+      return __dsh_point(el);
+    `)
+    const hit = await clickPoint(tabId, pt.x, pt.y, { chooser, cursor: { script, label: `点击 ${pt.text || pt.tag}` } })
+    return { ...hit, target: pt }
+  },
+
+  async type({ tabId, text, selector, script }) {
+    if (selector) await OPS.clickEl({ tabId, selector, script })
+    await ensure(tabId)
+    // 名牌写上在输什么。只有确认焦点落在普通（非密码）输入框里才亮原文：焦点在 shadow DOM / 同源 iframe 里
+    // 就往里找真正的焦点元素；找不到（跨域 iframe、关闭的 shadow root……）或者是密码样式的框，一律打码
+    const shown = JSON.stringify(text.length > 24 ? text.slice(0, 24) + '…' : text)
+    await cursorFx(tabId, `(() => {
+      let a = document.activeElement;
+      for (let i = 0; a && i < 32; i++) {
+        if (a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; }
+        if (a.tagName === 'IFRAME' || a.tagName === 'FRAME') { let d = null; try { d = a.contentDocument; } catch {} a = d && d.activeElement; continue; }
+        break;
+      }
+      let plain = false;
+      try {
+        const sec = (a.ownerDocument.defaultView || window).getComputedStyle(a).webkitTextSecurity || 'none';
+        plain = ((a.tagName === 'INPUT' && a.type !== 'password') || a.tagName === 'TEXTAREA' || a.isContentEditable) && sec === 'none';
+      } catch {}
+      window.__dshCursor.label(plain ? '输入「' + ${shown} + '」' : '输入 ••••••');
+      return 1;
+    })()`)
+    await send(tabId, 'Input.insertText', { text })
+    return { typed: text.length, selector: selector || null }
+  },
+
+  // ── 读取类：让模型能"看"页面 ──────────────────────────────────────────────
+
+  async text({ tabId, selector, limit = 8000 }) {
+    const js = selector
+      ? `(() => { const el = document.querySelector(${JSON.stringify(selector)}); return el ? (el.innerText || el.textContent || '') : null })()`
+      : `document.body ? (document.body.innerText || '') : ''`
+    const t = await evaluate(tabId, js)
+    if (t === null) throw new Error(`没找到元素: ${selector}`)
+    const s = String(t)
+    const cut = s.length > limit
+    return { text: cut ? s.slice(0, limit) + `\n…（截断，全文 ${s.length} 字）` : s, length: s.length, truncated: cut }
+  },
+
+  async html({ tabId, selector = 'body', limit = 4000 }) {
+    const t = await evaluate(tabId, `(() => { const el = document.querySelector(${JSON.stringify(selector)}); return el ? el.outerHTML : null })()`)
+    if (t === null) throw new Error(`没找到元素: ${selector}`)
+    const s = String(t)
+    const cut = s.length > limit
+    return { html: cut ? s.slice(0, limit) + `…（截断，全文 ${s.length} 字）` : s, length: s.length, truncated: cut }
+  },
+
+  async attr({ tabId, selector, name }) {
+    const value = await evaluate(tabId, `(() => { const el = document.querySelector(${JSON.stringify(selector)}); return el ? el.getAttribute(${JSON.stringify(name)}) : null })()`)
+    return { selector, name, value }
+  },
+
+  async info({ tabId }) {
+    const t = await chrome.tabs.get(Number(tabId))
+    let viewport = null
+    try {
+      await ensure(tabId)
+      const m = await send(tabId, 'Page.getLayoutMetrics')
+      const v = m.cssVisualViewport
+      viewport = { w: Math.round(v.clientWidth), h: Math.round(v.clientHeight), scrollY: Math.round(v.pageY) }
+    } catch {}
+    return {
+      tabId: Number(tabId), url: t.url, title: t.title, status: t.status,
+      windowId: t.windowId, active: t.active, attached: attached.has(Number(tabId)),
+      viewport, pendingDialog: dialogs.get(Number(tabId)) || null,
+    }
+  },
+
+  async waitFor({ tabId, selector, timeoutMs = 15000, visible = true }) {
+    const deadline = Date.now() + Number(timeoutMs)
+    const js = `(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      const vis = r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+      return { found: true, visible: vis, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), text: (el.innerText || '').trim().slice(0, 60) };
+    })()`
+    let last = null
+    while (Date.now() < deadline) {
+      last = await evaluate(tabId, js)
+      if (last && (!visible || last.visible)) return { ...last, waitedMs: Number(timeoutMs) - (deadline - Date.now()) }
+      await new Promise(r => setTimeout(r, 250))
+    }
+    throw new Error(`等了 ${timeoutMs}ms 还没等到 ${selector}${last ? '（元素在，但不可见）' : ''}`)
+  },
+
+  // ── 输入类 ───────────────────────────────────────────────────────────────
+
+  async hover({ tabId, x, y, selector, script }) {
+    let px = Number(x) || 0, py = Number(y) || 0, target = null
+    if (selector) {
+      const pt = await pointOf(tabId, `const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; return __dsh_point(el);`)
+      px = pt.x; py = pt.y; target = pt
+    }
+    if (script) {
+      const d = await cursorMove(tabId, script, px, py, { label: `悬停 ${target ? target.text || target.tag : `(${Math.round(px)}, ${Math.round(py)})`}` })
+      if (d !== null) await settle(d)
+    }
+    await send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(px), y: Math.round(py), buttons: 0 })
+    return { x: Math.round(px), y: Math.round(py), target }
+  },
+
+  async scroll({ tabId, x = 200, y = 200, deltaY = 600, deltaX = 0 }) {
+    const before = await evaluate(tabId, 'Math.round(window.scrollY)')
+    await cursorFx(tabId, `(window.__dshCursor.label(${JSON.stringify(deltaY < 0 ? '向上滚动' : '向下滚动')}, 1400), window.__dshCursor.scroll(${deltaY < 0 ? -1 : 1}), 1)`)
+    await sendNoReply(tabId, 'Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x: Math.round(x), y: Math.round(y),
+      deltaX: Math.round(deltaX), deltaY: Math.round(deltaY),
+    })
+    let after = await evaluate(tabId, '({ scrollY: Math.round(window.scrollY), pageHeight: Math.round(document.documentElement.scrollHeight) })')
+    let via = 'wheel'
+    if (after.scrollY === before) {
+      // 后台/不可见标签页里 Chrome 不会为滚轮合成帧（实测 mouseWheel 事件发了但页面不动），
+      // 退回 JS 滚动 —— 想要的效果是"页面滚下去"，不是"必须是合成事件"。
+      after = await evaluate(tabId, `(() => { window.scrollBy(0, ${Math.round(deltaY)}); return { scrollY: Math.round(window.scrollY), pageHeight: Math.round(document.documentElement.scrollHeight) } })()`)
+      via = 'js'
+    }
+    return { deltaY, via, ...after }
+  },
+
+  async focus({ tabId, selector }) {
+    const ok = await evaluate(tabId, `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.focus(); return document.activeElement === el })()`)
+    if (!ok) throw new Error(`聚焦失败: ${selector}`)
+    return { focused: selector }
+  },
+
+  async select({ tabId, selector, value }) {
+    const r = await evaluate(tabId, `(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return { ok: false, why: '找不到元素' };
+      if (el.tagName !== 'SELECT') return { ok: false, why: '不是 <select> 元素' };
+      const opts = [...el.options];
+      const hit = opts.find(o => o.value === ${JSON.stringify(value)}) || opts.find(o => (o.textContent || '').trim() === ${JSON.stringify(value)});
+      if (!hit) return { ok: false, why: '没有这个选项', options: opts.map(o => o.value).slice(0, 20) };
+      el.value = hit.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, value: hit.value, label: (hit.textContent || '').trim() };
+    })()`)
+    if (!r.ok) throw new Error(`选择失败：${r.why}${r.options ? '（可选值：' + r.options.join(', ') + '）' : ''}`)
+    return r
+  },
+
+  async upload({ tabId, selector, files, chooserId }) {
+    const list = Array.isArray(files) ? files : [files]
+    // 兜底（插件那边已按 realpath 卡过目录）：只收绝对路径，任何一段以 . 开头（隐藏目录 / 文件、..）都不收。
+    // 绝对路径：/ 开头（Mac / Linux），或盘符 C:\ 和 \\server\share（Windows；以前只认 /，Windows 上一律被拒）
+    for (const f of list) {
+      const s = String(f)
+      const abs = s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s) || /^\\\\[^\\]/.test(s)
+      if (!abs || s.split(/[\\/]/).some((seg) => seg.startsWith('.'))) {
+        throw new Error(`不能上传这个路径（要绝对路径，且不能在隐藏目录里 / 是隐藏文件）：${s}`)
+      }
+    }
+    await ensure(tabId)
+    if ((await fileAccess()) === false) throw fileAccessError()
+    const put = async (params) => {
+      try {
+        await send(tabId, 'DOM.setFileInputFiles', { files: list, ...params })
+      } catch (e) {
+        if (/Not allowed/.test(String(e && e.message || e))) throw fileAccessError()
+        throw e
+      }
+    }
+    if (!selector) {
+      // 没给选择器：塞给刚才拦下的选文件窗口对应的那个框（多半是藏起来的 <input type=file>）。
+      // 只认点击回话里给出的那个 id：同一个标签页别的会话后来又点开一个，不能把文件塞到人家的框里
+      const id = Number(tabId)
+      const c = choosers.get(id)
+      const none = () => new Error('NO_FILE_CHOOSER 页面现在没在等选文件：先点页面上的上传按钮，或者给出文件输入框的选择器')
+      if (c && Date.now() - c.at > CHOOSER_TTL_MS) dropChooser(id, c)
+      if (!c || !c.backendNodeId || c.folder || !chooserId || c.id !== String(chooserId) || Date.now() - c.at > CHOOSER_TTL_MS) throw none()
+      await c.ready
+      // 调试会话断开期间换过页（那时收不到 frameNavigated）：文档对不上就当框没了，别往别的节点上塞
+      // 只删自己这条：等回包的工夫别的请求可能已经拦下了新框
+      const drop = () => dropChooser(id, c)
+      if (c.doc && (await docOf(id, c.frameId, send)) !== c.doc) { drop(); throw none() }
+      const st = await inputState(id, c.backendNodeId, send, c.key)
+      // 拦下时在页面上、现在不在了（弹层关了重开、被页面换掉了）：别塞给脱离页面的旧节点。
+      // 拦下时就不在页面上的（脚本现造一个 input、不插进页面直接 click，很常见）照常塞
+      if (st && !st.on && c.state && c.state.on) { drop(); throw none() }
+      // 拦下以后用户自己点开过 / 选过（网页读完文件常把框清空，所以光比文件不够）：别拿模型的文件把它盖掉
+      if (st && c.state && (st.touched > 0 || st.files !== c.state.files)) { drop(); throw new Error('USER_PICKED 拦下以后有人自己动过这个文件框（多半是用户自己选了文件），没有替换') }
+      if (c.mode === 'selectSingle' && list.length > 1) throw new Error(`MULTI_NOT_ALLOWED 这个文件框一次只收一个文件（给了 ${list.length} 个）`)
+      try {
+        await put({ backendNodeId: c.backendNodeId })
+      } catch (e) {
+        // 页面换过 / 那个框被删了：节点找不到
+        if (/No node|Could not find node|not found/i.test(String(e && e.message || e))) { drop(); throw none() }
+        throw e
+      }
+      drop()
+      return { selector: null, chooser: true, files: list }
+    }
+    const { root } = await send(tabId, 'DOM.getDocument', { depth: -1, pierce: true })
+    const { nodeId } = await send(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector })
+    if (!nodeId) throw new Error(`没找到文件输入框: ${selector}`)
+    const { node } = await send(tabId, 'DOM.describeNode', { nodeId })
+    if (isFolderNode(node)) throw new Error('FOLDER_INPUT 这是选文件夹的框（webkitdirectory），DSH 暂时没法替你选文件夹：请用户自己点它选')
+    // 单选的框塞多个，Chrome 只留第一个：别报「都交了」
+    // 选中的不是文件框（比如旁边显示文件名的文本框）就不管，让 Chrome 自己报「不是文件框」
+    const isFile = node && String(node.nodeName).toUpperCase() === 'INPUT' && String(attrValue(node, 'type') || '').toLowerCase() === 'file'
+    if (list.length > 1 && isFile && !hasAttr(node, 'multiple')) {
+      throw new Error(`MULTI_NOT_ALLOWED 这个文件框一次只收一个文件（给了 ${list.length} 个）`)
+    }
+    await put({ nodeId })
+    // 塞的正是拦下的那个框才算用掉；别的框（别的会话正等着的）留着
+    const c = choosers.get(Number(tabId))
+    if (c && node && c.backendNodeId === node.backendNodeId) dropChooser(tabId, c)
+    return { selector, files: list }
+  },
+
+  /** 被 alert/confirm 挡住时用这个放行，否则页面会一直卡住 */
+  async dialog({ tabId, action, text }) {
+    const accept = action !== 'dismiss'
+    await send(tabId, 'Page.handleJavaScriptDialog', { accept, ...(text ? { promptText: text } : {}) })
+    dialogs.delete(Number(tabId))
+    return { action: accept ? 'accept' : 'dismiss' }
+  },
+
+  async key({ tabId, key, times = 1, chooser }) {
+    await ensure(tabId)
+    // 焦点在「上传」按钮上按回车 / 空格也会弹选文件窗口
+    return withChooser(tabId, chooser, async () => {
+      const out = []
+      for (let i = 0; i < times; i++) out.push(await pressKey(tabId, key))
+      return { pressed: key, times, modifiers: out[0] && out[0].modifiers }
+    })
+  },
+
+  async shot({ tabId, format = 'png', quality, full = false, selector }) {
+    await ensure(tabId)
+    const params = { format, captureBeyondViewport: !!full }
+    if (format === 'jpeg' && quality) params.quality = quality
+    let clip = null
+    if (selector) {
+      const rect = await evaluate(tabId, `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return null;
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        // 后台标签页会暂停 rAF —— 只等 rAF 会卡满 15 秒，定时器兜底（同 __dsh_point）
+        return new Promise((res) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            const r = el.getBoundingClientRect();
+            res({ x: r.left, y: r.top, width: r.width, height: r.height });
+          };
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+          setTimeout(finish, 120);
+        });
+      })()`)
+      if (!rect) throw new Error(`没找到元素: ${selector}`)
+      clip = { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 }
+      params.clip = clip
+      params.captureBeyondViewport = false
+    }
+    const r = await send(tabId, 'Page.captureScreenshot', params)
+    const t = await chrome.tabs.get(Number(tabId)).catch(() => null)
+    return { data: r.data, format, url: t && t.url, title: t && t.title, full: !!full, clip }
+  },
+
+  async network({ tabId, limit = 40, filter, clear, reload = false, waitMs = 2500 }) {
+    // 只清这个标签页的；不给 tabId 才全清（别把别的标签页的记录也抹了）
+    const dropTab = (id) => { for (let i = NET.length - 1; i >= 0; i--) if (NET[i].tabId === id) NET.splice(i, 1) }
+    if (clear) { if (tabId != null) dropTab(Number(tabId)); else NET.length = 0; return { cleared: true } }
+    // Network 事件只在 attach 之后才有，所以先 attach；要历史就 --reload 刷一次
+    if (tabId != null && reload) {
+      await ensure(tabId)
+      dropTab(Number(tabId))
+      await send(tabId, 'Page.reload', {})
+      await new Promise(r => setTimeout(r, Number(waitMs)))
+    } else if (tabId != null) {
+      await ensure(tabId)
+    }
+    let items = tabId != null ? NET.filter(n => n.tabId === Number(tabId)) : NET
+    if (filter) items = items.filter(n => (n.url || '').includes(filter) || (n.method || '').includes(filter))
+    return {
+      items: items.slice(-limit).map(n => ({
+        id: n.id, method: n.method, status: n.status, url: n.url, type: n.type, mime: n.mime, ms: n.ms, failed: n.failed,
+      })),
+    }
+  },
+
+  /**
+   * 录一段屏幕（CDP screencast），用来做演示 GIF。
+   * 帧以 base64 JPEG 返回；调用方自己写文件、自己合成。
+   */
+  async screencast({ tabId, durationMs = 5000, maxWidth = 900, quality = 70, maxFrames = 140 }) {
+    await ensure(tabId)
+    const id = Number(tabId)
+    const frames = []
+    const onEvent = (src, method, params) => {
+      if (src.tabId !== id) return
+      if (method !== 'Page.screencastFrame') return
+      frames.push(params.data)
+      chrome.debugger
+        .sendCommand({ tabId: id }, 'Page.screencastFrameAck', { sessionId: params.sessionId })
+        .catch(() => {})
+    }
+    chrome.debugger.onEvent.addListener(onEvent)
+    try {
+      await send(tabId, 'Page.startScreencast', {
+        format: 'jpeg', quality, maxWidth, maxHeight: Math.round(maxWidth * 1.4), everyNthFrame: 1,
+      })
+      const deadline = Date.now() + Number(durationMs)
+      // 帧太多会把一条 native message 撑爆（也拖慢回传），到上限就提前收工
+      while (Date.now() < deadline && frames.length < Number(maxFrames)) {
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      await send(tabId, 'Page.stopScreencast')
+    } finally {
+      chrome.debugger.onEvent.removeListener(onEvent)
+    }
+    return { count: frames.length, frames }
+  },
+
+  /** 页内光标：调用方把脚本内容传进来（每次都带也没事，注入过就不再执行），这里负责注入 + 调用 */
+  async cursor({ tabId, script, action, x, y, duration, straight, text }) {
+    const id = Number(tabId)
+    if (action === 'hide' || action === 'clear') {
+      try { await evaluate(tabId, 'window.__dshCursor && window.__dshCursor.hide()') }
+      finally { cursorReady.delete(id); cursorPos.delete(id); await markCursor(tabId, false) }
+      return { action }
+    }
+    if (!showCursor) return { action, skipped: '用户在弹窗里关了页内光标', duration: 0 }
+    const missing = () => new Error('光标脚本没装上（第一次调用要带 script）')
+    if (action === 'move' || action === 'click') {
+      const d = await cursorMove(tabId, script, x, y, { duration, straight, label: text })
+      if (d === null) throw missing()
+      if (action === 'click') {
+        await settle(d)
+        await cursorDo(tabId, script, `(window.__dshCursor.click(${Math.round(x)}, ${Math.round(y)}), 1)`)
+      }
+      return { action, x, y, duration: d }
+    }
+    const fx = { down: 'down()', up: 'up()', label: `label(${JSON.stringify(String(text || ''))})` }[action]
+    if (!fx) throw new Error(`不认识的光标动作: ${action}（move/click/down/up/label/hide/clear）`)
+    if ((await cursorDo(tabId, script, `(window.__dshCursor.${fx}, 1)`)) === undefined) throw missing()
+    return { action }
+  },
+}
+
+// ── 弹窗（popup.html）的接口 ─────────────────────────────────────────────────
+
+async function buildState() {
+  if (port && (!hostInfo || Date.now() - hostInfo.at > 5000)) post({ hostPing: true })
+  const now = Date.now()
+  const tabInfo = new Map()
+  for (const t of await chrome.tabs.query({})) tabInfo.set(t.id, t)
+  const self = `chrome-extension://${chrome.runtime.id}/`
+  const tabView = (id) => {
+    const t = tabInfo.get(id)
+    if (!t || (t.url || '').startsWith(self)) return null   // 弹窗页自己不算
+    return {
+      // 我们给受控标签页换上的小鼠标图标不是网站自己的，别拿来当它的图标
+      id, title: t.title || '', url: t.url || '', favIconUrl: t.favIconUrl === CURSOR_FAVICON ? '' : t.favIconUrl || '',
+      attached: attached.has(id), busy: inflight.has(id), lastUsed: lastUsed.get(id) || 0,
+      dialog: dialogs.get(id) || null,
+    }
+  }
+  const owned = new Set()
+  const sessions = []
+  for (const [k, s] of [...SESSIONS].sort((a, b) => b[1].last - a[1].last)) {
+    for (const id of s.tabs) if (!tabInfo.has(id)) s.tabs.delete(id)
+    const tabs = [...s.tabs].map(tabView).filter(Boolean)
+      .sort((a, b) => (b.attached - a.attached) || (b.lastUsed - a.lastUsed))
+    // 两小时没动静、手上也没有标签页的会话就不显示了
+    if (!tabs.some((t) => t.attached) && now - s.last > 2 * 3600e3) { SESSIONS.delete(k); continue }
+    tabs.forEach((t) => owned.add(t.id))
+    sessions.push({ key: s.key, kind: s.kind, session: s.session, pid: s.pid,
+      first: s.first, last: s.last, ops: s.ops, errors: s.errors, tabs })
+  }
+  const orphans = [...attached].filter((id) => !owned.has(id)).map(tabView).filter(Boolean)
+  return {
+    now,
+    version: chrome.runtime.getManifest().version,
+    connected: !!port,
+    paused,
+    host: hostInfo,
+    idleMs: DETACH_IDLE_MS,
+    attachedCount: controlledCount(),
+    showCursor,
+    ownWindow,
+    sessions,
+    orphans,
+    activity: ACTIVITY.slice(-30).reverse().map((a) => ({
+      ...a, title: a.tabId != null && tabInfo.has(a.tabId) ? tabInfo.get(a.tabId).title : '',
+    })),
+  }
+}
+
+async function releaseTab(tabId) {
+  await OPS.detach({ tabId })
+  ACTIVITY.push({ at: Date.now(), last: Date.now(), key: 'user', call: null, tool: null, hint: '',
+    op: 'userRelease', tabId: Number(tabId), ok: true, ms: 0, ops: 1 })
+  if (ACTIVITY.length > ACTIVITY_MAX) ACTIVITY.shift()
+}
+
+async function diagnostics() {
+  const st = await buildState()
+  const h = st.host
+  const lines = [
+    `Chrome Suite Bridge ${st.version}（${chrome.runtime.id}）`,
+    `浏览器：${navigator.userAgent}`,
+    `宿主：${st.connected ? '已连接' : '没连上'}${h ? `，pid ${h.pid}，socket ${h.socketOk ? '在听' : '没在听'}（${h.socket}），已处理 ${h.served} 次请求` : ''}`,
+    `暂停：${st.paused ? '是' : '否'}；页内光标：${st.showCursor ? '显示' : '关闭'}；新页开在：${st.ownWindow ? '单独窗口' : '当前窗口'}；受控标签页：${st.attachedCount}`,
+    `会话：${st.sessions.map((s) => `${s.key}（${s.ops} 次操作，${s.errors} 次失败，${s.tabs.length} 个标签页）`).join('；') || '无'}`,
+    '',
+    '最近失败：',
+    ...ACTIVITY.filter((a) => !a.ok).slice(-10).map((a) =>
+      `  ${new Date(a.at).toTimeString().slice(0, 8)} ${a.tool || a.op} ${a.hint || ''} → ${a.error}`),
+    '',
+    '扩展日志（最近 30 行）：',
+    ...LOG.slice(-30).map((l) => `  ${l}`),
+  ]
+  return lines.join('\n')
+}
+
+// ── 用户开关（弹窗和 DSH 设置页共用）────────────────────────────────────────
+
+async function releaseAllTabs() {
+  for (const id of [...attached]) await releaseTab(id)
+}
+
+/** where：谁按的（写进日志）。暂停时顺手全部松手。 */
+async function setPaused(on, where) {
+  paused = !!on
+  await chrome.storage.local.set({ paused })
+  log(`${paused ? '暂停' : '恢复'}了浏览器控制（${where}）`)
+  if (paused) await releaseAllTabs()
+  updateBadge()
+}
+
+async function setShowCursor(on, where) {
+  showCursor = !!on
+  await chrome.storage.local.set({ showCursor })
+  log(`${showCursor ? '打开' : '关掉'}了页内光标（${where}）`)
+  if (!showCursor) {
+    for (const id of [...cursorReady]) {
+      cursorReady.delete(id)
+      cursorPos.delete(id)
+      await hidePageCursor(id)
+      await markCursor(id, false)
+    }
+  }
+}
+
+async function setOwnWindow(on, where) {
+  ownWindow = !!on
+  await chrome.storage.local.set({ ownWindow })
+  log(`新开的页改成开在${ownWindow ? '单独窗口' : '当前窗口'}（${where}）`)
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || !msg.popup || sender.id !== chrome.runtime.id) return
+  const run = async () => {
+    switch (msg.popup) {
+      case 'state':
+        return buildState()
+      case 'reconnect':
+        if (port) { try { port.disconnect() } catch {} ; port = null; hostInfo = null }
+        connect()
+        await new Promise((r) => setTimeout(r, 700))
+        return buildState()
+      case 'release':
+        await releaseTab(msg.tabId)
+        return buildState()
+      case 'releaseAll':
+        await releaseAllTabs()
+        return buildState()
+      case 'focus':
+        await OPS.activate({ tabId: msg.tabId })
+        return buildState()
+      case 'pause':
+        // 解除暂停只认真正的工具栏弹窗（sender.tab 为空）；弹窗页被当成普通标签页打开时不算
+        if (!msg.on && sender.tab) throw new Error('恢复控制只能在 Chrome 工具栏的 Chrome Suite Bridge 弹窗里点')
+        await setPaused(!!msg.on, '弹窗')
+        return buildState()
+      case 'cursor':
+        await setShowCursor(!!msg.on, '弹窗')
+        return buildState()
+      case 'window':
+        await setOwnWindow(!!msg.on, '弹窗')
+        return buildState()
+      case 'diagnostics':
+        return { text: await diagnostics() }
+      default:
+        throw new Error(`弹窗发了不认识的请求: ${msg.popup}`)
+    }
+  }
+  run().then(sendResponse, (e) => sendResponse({ error: String((e && e.message) || e) }))
+  return true
+})
+
+// ── 保活 / 启动 ─────────────────────────────────────────────────────────────
+
+chrome.alarms.create('dsh-keepalive', { periodInMinutes: 1 })
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name !== 'dsh-keepalive') return
+  detachIdle().catch((e) => log('detachIdle 失败:', String(e && e.message || e)))   // 空闲超过 60 秒的标签页断开调试
+  if (!port) connect()
+  else post({ id: 'ka-' + Date.now(), ok: true, keepalive: true })
+})
+
+chrome.runtime.onStartup.addListener(connect)
+chrome.runtime.onInstalled.addListener(connect)
+// 每次 worker 起来都对一次账：认领还活着的分组、拆掉孤儿组和残留角标
+reconcileGroups()
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const sess of SESSIONS.values()) sess.tabs.delete(tabId)
+  ownTabs.delete(tabId)
+  attached.delete(tabId)
+  updateBadge()
+  lastUsed.delete(tabId)
+  groupedTabs.delete(tabId)   // 标签页都没了，组也轮不到我们拆
+  cursorReady.delete(tabId)
+  cursorPos.delete(tabId)
+  tabEpoch.delete(tabId)
+  dialogs.delete(tabId)
+  choosers.delete(tabId)
+  chooserSkip.delete(tabId)
+  failLoadWaiter(tabId, '标签页在加载中被关掉了')
+  if (agentTabs.delete(tabId)) saveAgentWindows()
+})
+chrome.windows.onRemoved.addListener((windowId) => {
+  forgetAgentWindow(windowId)   // 干活窗口被关了：下次新开页再开一个
+})
+connect()

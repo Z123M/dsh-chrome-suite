@@ -1,0 +1,442 @@
+#!/usr/bin/env node
+/**
+ * cb — DSH Bridge 命令行
+ *
+ * 用法速查（<tab> 可以写 active，省略时默认 active）：
+ *   cb status
+ *   cb tabs
+ *   cb eval   <tab> <js...>
+ *   cb click  <tab> <x> <y>
+ *   cb click-el   <tab> <选择器>
+ *   cb click-text <tab> <文字>
+ *   cb type   <tab> <文字> [--into <选择器>]
+ *   cb key    <tab> <按键> [--times N]      例：cb key active Enter / cb key active "meta+a"
+ *   cb nav    <tab> <url>
+ *   cb shot   [tab] [--out 路径] [--full 整页] [--sel 选择器] [--format png|jpeg]
+ *   cb network [tab] [--limit 40] [--filter 关键词] [--reload 先刷新再看] [--clear]
+ *   cb record  [tab] [--ms 5000] [--out 目录] [--width 900]   # 录一段 screencast 帧（做演示 GIF 用）
+ *   cb cursor <tab> move|click|hide [x] [y]
+ *   cb open   <url> [--front]            默认开进单独的干活窗口、**后台**（不抢你当前标签页）
+ *   cb window [on|off]                   新页开在单独窗口（on，默认）还是当前窗口后台（off）；不给参数就看现在是哪种
+ *   cb close <tab> / cb attach|detach <tab>
+ *   cb cdp    <tab> <方法> [json参数]
+ *   cb text   <tab> [选择器]              页面可见文字（默认整页）
+ *   cb html   <tab> [选择器]              外层 HTML
+ *   cb attr   <tab> <选择器> <属性名>
+ *   cb info   [tab]                       标题/URL/视口/有没有弹窗挡着
+ *   cb wait-for <tab> <选择器> [--timeout ms]
+ *   cb hover  <tab> (--sel <选择器> | <x> <y>)
+ *   cb scroll <tab> [--dy 600] [--dx 0]
+ *   cb focus  <tab> <选择器>
+ *   cb select <tab> <选择器> <值>
+ *   cb upload <tab> <选择器> <文件...>
+ *   cb dialog <tab> accept|dismiss [内容]   放行 alert/confirm/prompt
+ *   cb logs / cb console [tab]
+ *   cb version / cb reload      （改完扩展代码用它热重载，不用点 Chrome 刷新）
+ *
+ * 任何命令加 --json 出原始 JSON。
+ */
+
+import net from 'node:net'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+
+// 和宿主同一个约定：只有当前用户进得去的 /tmp/chrome-suite-bridge-<uid>/（Windows：%TEMP%\chrome-suite-bridge）
+const WIN = process.platform === 'win32'
+const DIR = process.env.DSH_BRIDGE_DIR || (WIN ? path.join(os.tmpdir(), 'chrome-suite-bridge') : `/tmp/chrome-suite-bridge-${process.getuid()}`)
+const TOKEN_FILE = process.env.DSH_BRIDGE_TOKEN || path.join(DIR, 'chrome-suite.token')
+const FIXED_SOCK = process.env.DSH_BRIDGE_SOCK || (WIN ? null : path.join(DIR, 'chrome-suite.sock'))
+
+/** token 文件：第一行 token；Windows 上第二行是宿主这次起的命名管道 */
+function tokenLines() {
+  try { return fs.readFileSync(TOKEN_FILE, 'utf8').split('\n').map((l) => l.trim()) } catch { return [] }
+}
+function hostSock() { return FIXED_SOCK || tokenLines()[1] || null }
+function hostUp() { const s = hostSock(); return Boolean(s) && (WIN || fs.existsSync(s)) }
+
+/** socket 所在目录必须是自己的、别人进不去：不然连上的可能是别人摆的假宿主（会把要打的字、要跑的 JS 都交出去） */
+function checkDir(dir) {
+  const st = fs.lstatSync(dir)
+  if (!st.isDirectory() || (!WIN && (st.uid !== process.getuid() || (st.mode & 0o077)))) {
+    throw new Error(`${dir} 不是只属于当前用户的目录，拒绝连接`)
+  }
+}
+
+const argv = process.argv.slice(2)
+const JSON_OUT = argv.includes('--json')
+const positional = []
+const flags = {}
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i]
+  if (a === '--json') continue
+  if (a.startsWith('--')) {
+    const k = a.slice(2)
+    const next = argv[i + 1]
+    if (next !== undefined && !next.startsWith('--')) { flags[k] = next; i++ }
+    else flags[k] = true
+  } else positional.push(a)
+}
+
+function die(msg) {
+  console.error('cb: ' + msg)
+  process.exit(1)
+}
+
+function readToken() {
+  return tokenLines()[0] || null
+}
+
+async function call(op, args = {}, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const SOCK = hostSock()
+    if (!hostUp()) {
+      return reject(new Error(`宿主没在跑（找不到 ${SOCK || TOKEN_FILE}）。Chrome 开着吗？扩展装了吗？`))
+    }
+    try { checkDir(WIN ? DIR : path.dirname(SOCK)) } catch (e) { return reject(e) }
+    const token = readToken()
+    const id = crypto.randomUUID()
+    const sock = net.connect(SOCK)
+    let acc = ''
+    let done = false
+    const finish = (fn, v) => { if (!done) { done = true; try { sock.destroy() } catch {}; fn(v) } }
+    sock.setEncoding('utf8')
+    sock.on('connect', () => sock.write(JSON.stringify({ token, id, op, args, timeoutMs }) + '\n'))
+    sock.on('data', (d) => {
+      acc += d
+      const i = acc.indexOf('\n')
+      if (i < 0) return
+      let msg
+      try { msg = JSON.parse(acc.slice(0, i)) } catch (e) { return finish(reject, new Error('宿主回了坏 JSON')) }
+      if (msg.ok) finish(resolve, msg.result)
+      else finish(reject, new Error(msg.error || '未知错误'))
+    })
+    sock.on('error', (e) => finish(reject, new Error(`连不上宿主：${e.message}`)))
+    sock.on('close', () => finish(reject, new Error('宿主连接被关掉了')))
+    setTimeout(() => finish(reject, new Error(`等宿主超时（${Math.round(timeoutMs / 1000)}s）`)), timeoutMs)
+  })
+}
+
+async function resolveTab(spec) {
+  if (spec && spec !== 'active') return Number(spec)
+  const tabs = await call('tabs')
+  const act = tabs.find(t => t.active)
+  if (!act) throw new Error('没有活动标签页')
+  return act.id
+}
+
+function cursorScript() {
+  const cands = [
+    process.env.DSH_CURSOR_JS,
+    path.join(os.homedir(), '.dsh/chrome-cursor/in-page-cursor.js'),
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../scratch/in-page-cursor.js'),
+  ].filter(Boolean)
+  for (const p of cands) {
+    try { return fs.readFileSync(p, 'utf8') } catch {}
+  }
+  throw new Error('找不到 in-page-cursor.js（可用 DSH_CURSOR_JS 指定）')
+}
+
+function cursorArg() {
+  if (flags['no-cursor']) return {}
+  try { return { script: cursorScript() } } catch { return {} }
+}
+
+function out(human, raw) {
+  if (JSON_OUT) console.log(JSON.stringify(raw, null, 2))
+  else console.log(human)
+}
+
+// ── 命令分发 ────────────────────────────────────────────────────────────────
+
+const [cmd, ...rest] = positional
+
+const USAGE = `cb <命令> [参数]     用 cb help 看完整用法`
+
+async function main() {
+  if (!cmd || cmd === 'help' || flags.help) {
+    console.log(fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].replace(/^\/\*\*?/, '').replace(/^ \* ?/gm, '').trim())
+    return
+  }
+
+  switch (cmd) {
+    case 'status': {
+      const s = await call('status')
+      out(`宿主 pid ${s.pid} | 扩展连接: ${s.extConnected ? '✅' : '❌'} | socket ${s.socket}`, s)
+      return
+    }
+    case 'version': {
+      const r = await call('version')
+      out(`扩展 v${r.version}  id ${r.id}`, r)
+      return
+    }
+    case 'window': {
+      // 和弹窗、DSH 设置页里的「新页开在单独窗口」是同一个开关
+      const on = rest[0]
+      if (on && on !== 'on' && on !== 'off') die('用法: cb window [on|off]')
+      // 先看扩展认不认这个开关：老扩展收到 window 动作只会报「不认识的 action」
+      let r = await call('panel', {})
+      if (!('ownWindow' in r)) die(`扩展版本较旧（v${r.version}），没有这个开关（要 1.13 以上）`)
+      if (on) r = await call('panel', { action: 'window', on: on === 'on' })
+      out(`新页开在：${r.ownWindow ? '单独的干活窗口' : '当前窗口（后台标签页）'}`, r)
+      return
+    }
+    case 'reload': {
+      const r = await call('reload')
+      out('扩展已触发重载（1 秒后再跑 cb status 确认）', r)
+      return
+    }
+    case 'tabs': {
+      const tabs = await call('tabs')
+      const lines = tabs.map(t => `${t.active ? '*' : ' '} ${String(t.id).padStart(5)} ${t.attached ? '🔗' : '  '} ${(t.title || '').slice(0, 48)} — ${t.url.slice(0, 70)}${t.agentWindow ? '（DSH 干活窗口）' : ''}`)
+      out(lines.join('\n'), tabs)
+      return
+    }
+    case 'find': {
+      const pat = (rest[0] || '').toLowerCase()
+      const tabs = (await call('tabs')).filter(t => (t.title || '').toLowerCase().includes(pat) || (t.url || '').toLowerCase().includes(pat))
+      out(tabs.map(t => `${String(t.id).padStart(5)} ${t.title} — ${t.url}`).join('\n') || '(没有匹配的标签页)', tabs)
+      return
+    }
+    case 'eval': {
+      const [tabSpec, ...jsParts] = rest
+      let expr = flags.file ? fs.readFileSync(String(flags.file), 'utf8') : jsParts.join(' ')
+      if (!expr) die('用法: cb eval <tab> <js>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('eval', { tabId, expression: expr })
+      out(typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2), r)
+      return
+    }
+    case 'cdp': {
+      const [tabSpec, method, paramsJson] = rest
+      if (!method) die('用法: cb cdp <tab> <方法> [json]')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('cdp', { tabId, method, params: paramsJson ? JSON.parse(paramsJson) : {} })
+      out(JSON.stringify(r.result, null, 2), r)
+      return
+    }
+    case 'nav': {
+      const [tabSpec, url] = rest
+      if (!url) die('用法: cb nav <tab> <url>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('nav', { tabId, url, wait: flags.nowait ? false : true })
+      out(`已到 ${r.url}${r.title ? ' — ' + r.title : ''}`, r)
+      return
+    }
+    case 'click': {
+      const [tabSpec, x, y] = rest
+      if (x === undefined) die('用法: cb click <tab> <x> <y>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('click', { tabId, x: Number(x), y: Number(y), clickCount: Number(flags.count || 1), ...cursorArg() })
+      out(`点了 (${r.x}, ${r.y})`, r)
+      return
+    }
+    case 'click-el': {
+      const [tabSpec, sel] = rest
+      if (!sel) die('用法: cb click-el <tab> <选择器>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('clickEl', { tabId, selector: sel, ...cursorArg() })
+      out(`点了 ${r.target.tag}「${r.target.text}」 @ (${r.x}, ${r.y})`, r)
+      return
+    }
+    case 'click-text': {
+      const [tabSpec, ...txt] = rest
+      const text = txt.join(' ')
+      if (!text) die('用法: cb click-text <tab> <文字>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('clickText', { tabId, text, exact: !flags.fuzzy, index: Number(flags.index || 0), ...cursorArg() })
+      out(`点了 ${r.target.tag}「${r.target.text}」 @ (${r.x}, ${r.y})`, r)
+      return
+    }
+    case 'type': {
+      const [tabSpec, ...txt] = rest
+      const text = txt.join(' ')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('type', { tabId, text, selector: flags.into || undefined, ...cursorArg() })
+      out(`输入了 ${r.typed} 个字符`, r)
+      return
+    }
+    case 'key': {
+      const [tabSpec, key] = rest
+      if (!key) die('用法: cb key <tab> <按键>，例 cb key active Enter / cb key active "meta+a"')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('key', { tabId, key, times: Number(flags.times || 1) })
+      out(`按了 ${key}${r.times > 1 ? ` ×${r.times}` : ''}`, r)
+      return
+    }
+    case 'text': {
+      const [tabSpec, sel] = rest
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('text', { tabId, selector: sel || undefined, limit: Number(flags.limit || 8000) })
+      out(r.text, r)
+      return
+    }
+    case 'html': {
+      const [tabSpec, sel] = rest
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('html', { tabId, selector: sel || 'body', limit: Number(flags.limit || 4000) })
+      out(r.html, r)
+      return
+    }
+    case 'attr': {
+      const [tabSpec, sel, name] = rest
+      if (!sel || !name) die('用法: cb attr <tab> <选择器> <属性名>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('attr', { tabId, selector: sel, name })
+      out(r.value === null ? '(没有这个属性)' : String(r.value), r)
+      return
+    }
+    case 'info': {
+      const tabId = await resolveTab(rest[0])
+      const r = await call('info', { tabId })
+      const v = r.viewport ? ` | 视口 ${r.viewport.w}×${r.viewport.h} @${r.viewport.scrollY}` : ''
+      const d = r.pendingDialog ? ` | ⚠️ 有 ${r.pendingDialog.type} 弹窗挡着：「${r.pendingDialog.message}」` : ''
+      out(`${r.title}\n${r.url}${v}${d}`, r)
+      return
+    }
+    case 'record': {
+      const tabId = await resolveTab(rest[0])
+      const ms = Number(flags.ms || 5000)
+      const dir = String(flags.out || path.join(WIN ? os.tmpdir() : '/tmp', `dsh-frames-${Date.now()}`))
+      fs.mkdirSync(dir, { recursive: true })
+      const r = await call('screencast', {
+        tabId, durationMs: ms, maxWidth: Number(flags.width || 900), quality: Number(flags.quality || 70),
+      }, ms + 30000)
+      r.frames.forEach((b64, i) => {
+        fs.writeFileSync(`${dir}/frame_${String(i).padStart(4, '0')}.jpg`, Buffer.from(b64, 'base64'))
+      })
+      out(`${r.count} 帧 → ${dir}（${ms}ms，${flags.width || 900}px 宽）`, { dir, count: r.count })
+      return
+    }
+    case 'wait-for': {
+      const [tabSpec, sel] = rest
+      if (!sel) die('用法: cb wait-for <tab> <选择器> [--timeout 15000]')
+      const tabId = await resolveTab(tabSpec)
+      const ms = Number(flags.timeout || 15000)
+      const r = await call('waitFor', { tabId, selector: sel, timeoutMs: ms, visible: !flags.any }, ms + 15000)
+      out(`等到了 ${sel} @ (${r.x}, ${r.y})「${r.text}」用了 ${r.waitedMs}ms`, r)
+      return
+    }
+    case 'hover': {
+      const [tabSpec, x, y] = rest
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('hover', { tabId, x: Number(x), y: Number(y), selector: flags.sel || undefined })
+      out(`悬停到 (${r.x}, ${r.y})${r.target ? ` ${r.target.tag}「${r.target.text}」` : ''}`, r)
+      return
+    }
+    case 'scroll': {
+      const tabId = await resolveTab(rest[0])
+      const r = await call('scroll', {
+        tabId, x: Number(flags.x || 200), y: Number(flags.y || 200),
+        deltaY: Number(flags.dy || 600), deltaX: Number(flags.dx || 0),
+      })
+      out(`滚了 ${r.deltaY}px，现在 scrollY=${r.scrollY} / 页高 ${r.pageHeight}`, r)
+      return
+    }
+    case 'focus': {
+      const [tabSpec, sel] = rest
+      if (!sel) die('用法: cb focus <tab> <选择器>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('focus', { tabId, selector: sel })
+      out(`已聚焦 ${r.focused}`, r)
+      return
+    }
+    case 'select': {
+      const [tabSpec, sel, value] = rest
+      if (!sel || value === undefined) die('用法: cb select <tab> <选择器> <值>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('select', { tabId, selector: sel, value })
+      out(`选了「${r.label}」(${r.value})`, r)
+      return
+    }
+    case 'upload': {
+      const [tabSpec, sel, ...files] = rest
+      if (!sel || !files.length) die('用法: cb upload <tab> <选择器> <文件...>')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('upload', { tabId, selector: sel, files })
+      out(`塞了 ${r.files.length} 个文件进 ${r.selector}`, r)
+      return
+    }
+    case 'dialog': {
+      const [tabSpec, action, ...txt] = rest
+      if (!action) die('用法: cb dialog <tab> accept|dismiss [输入内容]')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('dialog', { tabId, action, text: txt.join(' ') || undefined })
+      out(`${r.action === 'accept' ? '放行' : '取消'}了弹窗`, r)
+      return
+    }
+    case 'shot': {
+      const tabId = await resolveTab(rest[0])
+      const format = flags.format === 'jpeg' ? 'jpeg' : 'png'
+      const r = await call('shot', {
+        tabId, format,
+        quality: flags.quality ? Number(flags.quality) : undefined,
+        full: !!flags.full,
+        selector: flags.sel || undefined,
+      }, 90000)
+      const file = String(flags.out || path.join(WIN ? os.tmpdir() : '/tmp', `dsh-shot-${Date.now()}.${format === 'jpeg' ? 'jpg' : 'png'}`))
+      fs.writeFileSync(file, Buffer.from(r.data, 'base64'))
+      out(file, { file, format, url: r.url, title: r.title, bytes: fs.statSync(file).size, full: r.full, clip: r.clip })
+      return
+    }
+    case 'network': {
+      const tabId = rest[0] ? await resolveTab(rest[0]) : undefined
+      const r = await call('network', {
+        tabId, limit: Number(flags.limit || 40), filter: flags.filter || undefined,
+        clear: !!flags.clear, reload: !!flags.reload,
+      })
+      if (r.cleared) { out('已清空网络记录', r); return }
+      const lines = r.items.map(n => {
+        const mark = n.failed ? '✗' : String(n.status || '…')
+        return `${mark.padStart(3)} ${String(n.method).padEnd(6)} ${String(n.ms ?? '').padStart(6)}ms ${String(n.url).slice(0, 88)}`
+      })
+      out(lines.join('\n') || '(还没记录到请求；先让页面动起来)', r)
+      return
+    }
+    case 'cursor': {
+      const [tabSpec, action, x, y] = rest
+      if (!action) die('用法: cb cursor <tab> move|click|hide [x] [y]')
+      const tabId = await resolveTab(tabSpec)
+      const r = await call('cursor', { tabId, script: cursorScript(), action, x: Number(x), y: Number(y) })
+      out(`光标 ${action}${x !== undefined ? ` → (${x}, ${y})` : ''}`, r)
+      return
+    }
+    case 'open': {
+      // 默认开进 DSH 的干活窗口（后台）—— 不抢用户当前标签页。想看它跳出来就加 --front（开在当前窗口前台）
+      const active = !!flags.front
+      const r = await call('open', { url: rest[0], active })
+      out(`开了新标签 ${r.tabId}（${active ? '前台' : r.window === 'agent' ? '单独的干活窗口，后台' : '后台，不抢焦点'}）：${r.url}`, r)
+      return
+    }
+    case 'close': {
+      const tabId = await resolveTab(rest[0])
+      const r = await call('close', { tabId })
+      out(`关了 ${r.closed}`, r)
+      return
+    }
+    case 'attach':
+    case 'detach': {
+      const tabId = await resolveTab(rest[0])
+      const r = await call(cmd, { tabId })
+      out(`${cmd} ${tabId} → ${r.attached ? '已连接' : '已断开'}`, r)
+      return
+    }
+    case 'logs': {
+      const r = await call('logs', { limit: Number(flags.limit || 60) })
+      out(r.lines.join('\n') || '(空)', r)
+      return
+    }
+    case 'console': {
+      const tabId = rest[0] ? await resolveTab(rest[0]) : undefined
+      const r = await call('console', { limit: Number(flags.limit || 40), tabId })
+      out(r.items.map(i => `[${i.level}] ${i.text}`).join('\n') || '(空)', r)
+      return
+    }
+    default:
+      die(`不认识命令 "${cmd}"。${USAGE}`)
+  }
+}
+
+main().then(() => process.exit(0), e => die(e.message))

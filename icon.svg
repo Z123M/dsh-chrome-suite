@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Chrome Suite Bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1F2937"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect x="20" y="26" width="88" height="66" rx="10" fill="none" stroke="#E5E7EB" stroke-width="5"/>
+  <path d="M20 44h88" stroke="#E5E7EB" stroke-width="5"/>
+  <circle cx="31" cy="35" r="3.2" fill="#38BDF8"/>
+  <circle cx="42" cy="35" r="3.2" fill="#94A3B8"/>
+  <path d="M34 56h34M34 68h22" stroke="#94A3B8" stroke-width="5" stroke-linecap="round"/>
+  <path d="M74 70l30 12-12 4.6-4.6 12z" fill="#38BDF8" stroke="#0B1220" stroke-width="3" stroke-linejoin="round"/>
+</svg>

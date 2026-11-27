@@ -1,0 +1,410 @@
+/**
+ * dsh-chrome-suite 的网页端：DSH「插件」页里我们这张卡的设置页。
+ *
+ *   连接状态（扩展 / 本机程序、版本、正在控制哪些标签页）+ 全部放开；文字有中 / 英 / 俄三份，跟着 DSH 的界面语言
+ *   三个开关：允许 DSH 控制浏览器（这里只能关）、页面里显示 DSH 光标、新页开在单独窗口
+ *   没连上时：差哪一步、一键帮你打开安装页
+ *
+ * 数据全走插件自己挂在 DSH webServer 上的路由（plugin/panel.js），每 2.5 秒刷一次。
+ * 走官方客户端插件机制：window.__ModuleLoader__.load({ id, factory })，factory 里 apply(ctx)
+ * → 注册到 plugins.bundle.config（包详情页）和 plugins.row.config（行详情页）两个 keyed slot。
+ * 拿不到 react 或 DSH 的组件就安静退出 / 用最朴素的替身，别把宿主页面搞崩。
+ */
+window.__ModuleLoader__.load({
+  id: 'dsh-chrome-suite',
+  factory: (require) => {
+    var module = { exports: {} }
+    var exports = module.exports
+
+    const opt = (id) => { try { return require(id) } catch (_) { return null } }
+    const React = opt('react')
+    if (!React) {
+      exports.apply = () => {}
+      exports.inject = ['slots', 'locale']
+      return module.exports
+    }
+    const h = React.createElement
+    const { useState, useEffect, useCallback, useRef } = React
+
+    const PKG = 'dsh-chrome-suite'
+    const ROW = 'chrome-suite'
+    const NS = 'dsh-chrome-suite'
+    const ROUTE = '/dsh-chrome-suite/panel'
+    const REPO = 'https://github.com/OrderG-X/dsh-chrome-bridge'
+
+    // 占位符用 %x：不跟 DSH 自己的 {name} 插值撞
+    const zh = {
+      title: 'Chrome 浏览器套件',
+      checking: '正在检查…',
+      connected: '已连接',
+      paused: '已暂停',
+      disconnected: '未连接',
+      unsupported: '目前只支持 macOS、Windows、Linux',
+      summaryOn: '已连接 · 正在控制 %n 个标签页',
+      summaryIdle: '已连接，没有在控制的标签页',
+      summaryOff: '还没连上 Chrome，点开看怎么装',
+      summaryPaused: '已暂停：DSH 暂时不能操作浏览器',
+      summaryStale: '连接状态更新失败',
+      stale: '状态已过期（%error）；最后成功更新：%time',
+      storeBuild: '上游商店版',
+      localBuild: '本地版',
+      controlling: '正在控制 %n 个标签页',
+      controllingIdle: '没有在控制的标签页',
+      releaseAll: '全部放开',
+      released: '已全部放开',
+      allowControl: '允许 DSH 控制浏览器',
+      allowControlHint: '关掉后，DSH 碰不了浏览器。要重新打开，得去 Chrome 工具栏点 Chrome Suite Bridge 图标——DSH 自己打不开。',
+      resumeInChrome: '要恢复：点 Chrome 工具栏上的 Chrome Suite Bridge 图标，在里面把控制重新打开。',
+      showCursor: '页面里显示 DSH 光标',
+      showCursorHint: '关掉只是不显示光标，点击、输入照做。',
+      ownWindow: '新页开在单独窗口',
+      ownWindowHint: 'DSH 新开的页放进一个单独的 Chrome 窗口，登录状态照样在，不往你正在用的窗口里塞，也不抢焦点。关掉就开在你当前窗口的后台。',
+      ownWindowOld: 'Chrome 里的扩展更新后才有这个开关，现在新页开在你当前窗口的后台。',
+      outdated: 'Chrome 里的扩展版本旧了，更新后才能在这里改开关。',
+      setupTitle: '还差一步：把扩展装进 Chrome',
+      setupStoreTitle: '扩展装好了，但还没连上',
+      setupStep1: '打开 Chrome，地址栏输入 chrome://extensions，打开右上角的「开发者模式」',
+      setupStep2: '点「加载已解压的扩展程序」，选这个文件夹：',
+      setupStep3: '装好后这里会自动变成「已连接」',
+      setupStoreAlt: '更省事：直接从 Chrome 应用商店装，不用开发者模式。',
+      openStore: '去商店装',
+      storeOpened: '已在 Chrome 里打开商店页，点「添加至 Chrome」就行',
+      setupStore1: '确认 Chrome 开着，并且扩展是启用状态',
+      setupStore2: '还不行就重启一下 Chrome',
+      openInstall: '帮我打开安装页',
+      installOpened: '已在 Chrome 里打开扩展页',
+      pathCopied: '，文件夹路径也复制好了（文件框里按 ⌘⇧G 再 ⌘V）',
+      pathCopiedWin: '，文件夹路径也复制好了（粘进文件框顶上的地址栏、回车）',
+      plugin: '插件 v%v',
+      guide: '上游项目',
+      failed: '没成功：%e',
+      unreachable: '读不到插件状态，重启 DSH 后再试',
+      privacyNotice: '此扩展可访问 Chrome 普通网页。页面内容、截图和调试结果会进入 DSH 会话，并可能发送给配置的模型服务；避免读取密码、支付或其他敏感信息。',
+    }
+    const en = {
+      title: 'Chrome browser suite',
+      checking: 'Checking…',
+      connected: 'Connected',
+      paused: 'Paused',
+      disconnected: 'Not connected',
+      unsupported: 'Supports macOS, Windows and Linux only',
+      summaryOn: 'Connected · controlling %n tab(s)',
+      summaryIdle: 'Connected, no tabs under control',
+      summaryOff: 'Not connected to Chrome yet — open for setup steps',
+      summaryPaused: 'Paused: DSH cannot operate the browser',
+      summaryStale: 'Browser connection status is stale',
+      stale: 'Status is out of date (%error); last successful update: %time',
+      storeBuild: 'Upstream store',
+      localBuild: 'Local',
+      controlling: 'Controlling %n tab(s)',
+      controllingIdle: 'No tabs under control',
+      releaseAll: 'Release all',
+      released: 'Released all tabs',
+      allowControl: 'Allow DSH to control the browser',
+      allowControlHint: 'When off, DSH can\'t touch the browser. To turn it back on, click the Chrome Suite Bridge icon in Chrome\'s toolbar; DSH can\'t do that itself.',
+      resumeInChrome: 'To resume, click the Chrome Suite Bridge icon in Chrome\'s toolbar and turn control back on there.',
+      showCursor: 'Show the DSH cursor on pages',
+      showCursorHint: 'Off only hides the cursor; clicks and typing still happen.',
+      ownWindow: 'Open new pages in a separate window',
+      ownWindowHint: 'Pages DSH opens go into their own Chrome window, with your logins, instead of piling up in the window you are using, and never take focus. Off: background tabs in your current window.',
+      ownWindowOld: 'Update the extension in Chrome to get this switch; for now new pages open as background tabs in your current window.',
+      outdated: 'The extension in Chrome is out of date; update it to change these switches here.',
+      setupTitle: 'One step left: add the extension to Chrome',
+      setupStoreTitle: 'The extension is installed but not connected yet',
+      setupStep1: 'Open chrome://extensions in Chrome and turn on Developer mode (top right)',
+      setupStep2: 'Click "Load unpacked" and choose this folder:',
+      setupStep3: 'This page turns to "Connected" once it is loaded',
+      setupStoreAlt: 'Easier: install it from the Chrome Web Store, no Developer mode needed.',
+      openStore: 'Get it from the store',
+      storeOpened: 'Opened the store page in Chrome; click "Add to Chrome"',
+      setupStore1: 'Make sure Chrome is running and the extension is enabled',
+      setupStore2: 'If it still does not connect, restart Chrome',
+      openInstall: 'Open the install page for me',
+      installOpened: 'Opened the extensions page in Chrome',
+      pathCopied: '; the folder path is on the clipboard (⌘⇧G then ⌘V in the file picker)',
+      pathCopiedWin: '; the folder path is on the clipboard (paste it into the file picker\'s address bar)',
+      plugin: 'Plugin v%v',
+      guide: 'Upstream project',
+      failed: 'That did not work: %e',
+      unreachable: 'Could not read plugin status; restart DSH and try again',
+      privacyNotice: 'This extension can access ordinary Chrome pages. Page content, screenshots and diagnostics enter the DSH session and may be sent to your configured model service; avoid exposing passwords, payment details or other sensitive information.',
+    }
+
+    const ru = {
+      title: 'Комплект Chrome',
+      checking: 'Проверка…',
+      connected: 'Подключено',
+      paused: 'Пауза',
+      disconnected: 'Не подключено',
+      unsupported: 'Работает только на macOS, Windows и Linux',
+      summaryOn: 'Подключено · вкладок под управлением: %n',
+      summaryIdle: 'Подключено, вкладок под управлением нет',
+      summaryOff: 'Chrome ещё не подключён — откройте, чтобы увидеть шаги',
+      summaryPaused: 'Пауза: DSH не может работать с браузером',
+      summaryStale: 'Состояние соединения устарело',
+      stale: 'Данные устарели (%error); последнее успешное обновление: %time',
+      storeBuild: 'Магазин (upstream)',
+      localBuild: 'Локальная',
+      controlling: 'Вкладок под управлением: %n',
+      controllingIdle: 'Вкладок под управлением нет',
+      releaseAll: 'Отпустить все',
+      released: 'Все вкладки отпущены',
+      allowControl: 'Разрешить DSH управлять браузером',
+      allowControlHint: 'Выкл.: DSH не может трогать браузер. Включить обратно можно только через значок Chrome Suite Bridge на панели инструментов Chrome — сам DSH этого сделать не может.',
+      resumeInChrome: 'Чтобы продолжить, нажмите значок Chrome Suite Bridge на панели инструментов Chrome и снова включите управление.',
+      showCursor: 'Показывать курсор DSH',
+      showCursorHint: 'Выкл. только скрывает курсор, клики и ввод продолжаются.',
+      ownWindow: 'Новые страницы в отдельном окне',
+      ownWindowHint: 'Страницы, которые открывает DSH, попадают в отдельное окно Chrome (ваши входы в аккаунты сохраняются), не засоряют ваше окно и не перехватывают фокус. Выкл.: фоновые вкладки в текущем окне.',
+      ownWindowOld: 'Обновите расширение в Chrome, чтобы появился этот переключатель; пока новые страницы открываются фоном в текущем окне.',
+      outdated: 'Расширение в Chrome устарело; обновите его, чтобы менять переключатели здесь.',
+      setupTitle: 'Остался один шаг: добавить расширение в Chrome',
+      setupStoreTitle: 'Расширение установлено, но ещё не подключено',
+      setupStep1: 'Откройте в Chrome chrome://extensions и включите «Режим разработчика» справа вверху',
+      setupStep2: 'Нажмите «Загрузить распакованное расширение» и выберите эту папку:',
+      setupStep3: 'Как только расширение загрузится, здесь появится «Подключено»',
+      setupStoreAlt: 'Проще: установить из Chrome Web Store, режим разработчика не нужен.',
+      openStore: 'Открыть магазин',
+      storeOpened: 'Страница магазина открыта в Chrome — нажмите «Установить»',
+      setupStore1: 'Проверьте, что Chrome запущен и расширение включено',
+      setupStore2: 'Если не помогло — перезапустите Chrome',
+      openInstall: 'Открыть страницу установки',
+      installOpened: 'Страница расширений открыта в Chrome',
+      pathCopied: '; путь к папке скопирован (в окне выбора файлов ⌘⇧G, затем ⌘V)',
+      pathCopiedWin: '; путь к папке скопирован (вставьте его в адресную строку окна выбора файлов)',
+      plugin: 'Плагин v%v',
+      guide: 'Проект upstream',
+      failed: 'Не получилось: %e',
+      unreachable: 'Не удалось прочитать состояние плагина; перезапустите DSH и попробуйте снова',
+      privacyNotice: 'Расширение может получать доступ к обычным страницам Chrome. Содержимое страниц, снимки и диагностика попадают в сеанс DSH и могут быть отправлены настроенной модели; не передавайте пароли, платёжные данные и другую конфиденциальную информацию.',
+    }
+
+    const fmt = (s, vars) => String(s).replace(/%([a-z])/g, (m, k) => (vars && k in vars ? String(vars[k]) : m))
+
+    const CSS = `
+.dcb{display:grid;gap:12px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5}
+.dcb-card{border:1px solid var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l));background:var(--dsw-alias-settings-card-fill,transparent);border-radius:8px;overflow:hidden}
+.dcb-row{display:flex;align-items:flex-start;gap:12px;padding:12px 14px}
+.dcb-row+.dcb-row{border-top:1px solid var(--dsw-alias-border-l)}
+.dcb-main{flex:1;min-width:0;display:grid;gap:2px}
+.dcb-title{font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dcb-sub{color:var(--dsw-alias-label-secondary);font-size:12px}
+.dcb-hint{color:var(--dsw-alias-label-tertiary);font-size:12px;margin:0}
+.dcb-dot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:6px;background:var(--dsw-alias-label-tertiary)}
+.dcb-dot[data-s=on]{background:var(--dsw-alias-state-success-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-success-primary) 22%,transparent)}
+.dcb-dot[data-s=paused]{background:var(--dsw-alias-state-warn-primary)}
+.dcb-dot[data-s=off]{background:var(--dsw-alias-state-error-primary)}
+.dcb-tabs{margin:6px 0 0;padding:0;list-style:none;display:grid;gap:2px}
+.dcb-tabs li{color:var(--dsw-alias-label-secondary);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dcb-steps{margin:6px 0 0;padding-left:18px;display:grid;gap:4px;color:var(--dsw-alias-label-secondary)}
+.dcb-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);user-select:all}
+.dcb-note{font-size:12px;padding:8px 12px;border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 12%,transparent);color:var(--dsw-alias-label-primary)}
+.dcb-note[data-tone=ok]{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent)}
+.dcb-note[data-tone=err]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.dcb-foot{display:flex;gap:10px;align-items:center;color:var(--dsw-alias-label-tertiary);font-size:12px}
+.dcb-foot a{color:var(--dsw-alias-link);text-decoration:none}
+.dcb-security{font-size:12px;padding:8px 12px;border:1px solid var(--dsw-alias-state-warn-primary);border-radius:8px;color:var(--dsw-alias-label-primary)}
+.dcb-tag{font-size:11px;font-weight:500;padding:0 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l);color:var(--dsw-alias-label-secondary)}
+.dcb-btn{font:inherit;font-size:12px;padding:4px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l);background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;white-space:nowrap}
+.dcb-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.dcb-btn[data-primary=true]{background:var(--dsw-alias-interactive-primary);border-color:var(--dsw-alias-interactive-primary);color:var(--dsw-alias-label-inverse,white)}
+.dcb-btn:disabled{opacity:.45;cursor:default}
+.dcb-switch{flex:none;margin-top:2px}`
+    function Toggle({ checked, disabled, label, onChange }) {
+      return h('input', {
+        className: 'dcb-switch',
+        type: 'checkbox',
+        role: 'switch',
+        'aria-label': label,
+        'aria-checked': checked,
+        checked,
+        disabled,
+        onChange: (e) => onChange(e.target.checked),
+      })
+    }
+    function Btn({ onClick, disabled, children, primary }) {
+      return h('button', {
+        type: 'button',
+        className: 'dcb-btn',
+        'data-primary': primary ? 'true' : undefined,
+        disabled,
+        onClick,
+      }, children)
+    }
+
+    // ── 数据 ──────────────────────────────────────────────────────────────
+    async function fetchState(action) {
+      const res = await fetch(ROUTE, action
+        ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(action), credentials: 'same-origin' }
+        : { credentials: 'same-origin', cache: 'no-store' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return res.json()
+    }
+
+    /** 2.5 秒刷一次；页面藏起来时不刷。 */
+    function useBridgeState() {
+      const [state, setState] = useState(null)
+      const [error, setError] = useState('')
+      const [lastSuccess, setLastSuccess] = useState(0)
+      const alive = useRef(true)
+      const load = useCallback(async () => {
+        try {
+          const s = await fetchState()
+          if (alive.current) { setState(s); setError(''); setLastSuccess(Date.now()) }
+        } catch (e) {
+          if (alive.current) setError(String((e && e.message) || e))
+        }
+      }, [])
+      useEffect(() => {
+        alive.current = true
+        load()
+        const timer = setInterval(() => {
+          if (typeof document === 'undefined' || document.visibilityState !== 'hidden') load()
+        }, 2500)
+        return () => { alive.current = false; clearInterval(timer) }
+      }, [load])
+      const act = useCallback(async (action) => {
+        const s = await fetchState(action)
+        if (alive.current) { setState(s); setError(''); setLastSuccess(Date.now()) }
+        return s
+      }, [])
+      return { state, error, lastSuccess, act }
+    }
+
+    function phaseOf(s) {
+      if (!s) return 'checking'
+      if (s.platform && !['darwin', 'win32', 'linux'].includes(s.platform)) return 'unsupported'
+      if (!s.connected) return 'off'
+      return s.paused ? 'paused' : 'on'
+    }
+
+    // ── 概要（行卡片上的一句话）────────────────────────────────────────────
+    function Summary({ t }) {
+      const { state, error } = useBridgeState()
+      const p = error ? 'stale' : phaseOf(state)
+      if (p === 'checking') return t('checking')
+      if (p === 'unsupported') return t('unsupported')
+      if (p === 'stale') return t('summaryStale')
+      if (p === 'off') return t('summaryOff')
+      if (p === 'paused') return t('summaryPaused')
+      return state.attachedCount ? fmt(t('summaryOn'), { n: state.attachedCount }) : t('summaryIdle')
+    }
+
+    // ── 设置页 ────────────────────────────────────────────────────────────
+    function Page({ t }) {
+      const { state, error, lastSuccess, act } = useBridgeState()
+      const [busy, setBusy] = useState(false)
+      const [note, setNote] = useState(null)
+      const stale = Boolean(error)
+      const p = stale ? 'stale' : phaseOf(state)
+      const can = !!state && !stale && state.connected && !state.outdated && !busy
+
+      const run = async (action, ok) => {
+        setBusy(true)
+        try {
+          const s = await act(action)
+          if (s.actionError) setNote({ tone: 'err', text: fmt(t('failed'), { e: s.actionError }) })
+          else setNote(ok ? { tone: 'ok', text: typeof ok === 'function' ? ok(s) : ok } : null)
+        } catch (e) {
+          setNote({ tone: 'err', text: fmt(t('failed'), { e: String((e && e.message) || e) }) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const statusTitle = { checking: t('checking'), on: t('connected'), paused: t('paused'), off: t('disconnected'), stale: t('summaryStale'), unsupported: t('unsupported') }[p]
+      const ext = state && state.ext
+      const status = h('div', { className: 'dcb-card' },
+        h('div', { className: 'dcb-row' },
+          h('span', { className: 'dcb-dot', 'data-s': p === 'unsupported' || stale ? 'off' : p }),
+          h('div', { className: 'dcb-main' },
+            h('div', { className: 'dcb-title' }, statusTitle,
+              !stale && ext ? h('span', { className: 'dcb-tag' }, `${ext.store ? t('storeBuild') : t('localBuild')} v${ext.version}`) : null),
+              !stale && state && state.connected
+                ? h('div', { className: 'dcb-sub' }, state.attachedCount ? fmt(t('controlling'), { n: state.attachedCount }) : t('controllingIdle'))
+                : null,
+            !stale && state && state.tabs && state.tabs.length
+              ? h('ul', { className: 'dcb-tabs' }, state.tabs.map((tab, i) => h('li', { key: i, title: tab.url }, tab.title || tab.url)))
+              : null,
+            p === 'paused' ? h('p', { className: 'dcb-hint' }, t('resumeInChrome')) : null),
+          !stale && state && state.connected
+            ? h(Btn, { disabled: !can || !state.attachedCount, onClick: () => run({ action: 'releaseAll' }, t('released')) }, t('releaseAll'))
+            : null))
+
+      const setup = p === 'off' && state ? h('div', { className: 'dcb-card' },
+        h('div', { className: 'dcb-row' },
+          h('div', { className: 'dcb-main' },
+            h('div', { className: 'dcb-title' }, t('setupTitle')),
+            h('ol', { className: 'dcb-steps' },
+              h('li', null, t('setupStep1')),
+              h('li', null, t('setupStep2'), ' ', h('span', { className: 'dcb-path' }, state.extDir)),
+              h('li', null, t('setupStep3')))),
+          h(Btn, { primary: true, disabled: busy, onClick: () => run({ action: 'install' }, (s) => t('installOpened') + (s.assist && s.assist.clipboard ? t(state.platform === 'win32' ? 'pathCopiedWin' : 'pathCopied') : '')) }, t('openInstall')))) : null
+
+      const switches = !stale && state && state.connected ? h('div', { className: 'dcb-card' },
+        h('div', { className: 'dcb-row' },
+          h('div', { className: 'dcb-main' },
+            h('div', { className: 'dcb-title' }, t('allowControl')),
+            h('p', { className: 'dcb-hint' }, t('allowControlHint'))),
+          h(Toggle, {
+            label: t('allowControl'),
+            checked: !state.paused,
+            // 只能往「关」的方向拨：打开要去 Chrome 里点
+            disabled: !can || state.paused,
+            onChange: (on) => { if (!on) run({ action: 'pause' }) },
+          })),
+        h('div', { className: 'dcb-row' },
+          h('div', { className: 'dcb-main' },
+            h('div', { className: 'dcb-title' }, t('showCursor')),
+            h('p', { className: 'dcb-hint' }, t('showCursorHint'))),
+          h(Toggle, { label: t('showCursor'), checked: state.showCursor !== false, disabled: !can, onChange: (on) => run({ action: 'cursor', on }) })),
+        // 商店里还没更新的老扩展没有这个设置（state 里没有 ownWindow）：照实说，开关不给点
+        state.outdated ? null : h('div', { className: 'dcb-row' },
+          h('div', { className: 'dcb-main' },
+            h('div', { className: 'dcb-title' }, t('ownWindow')),
+            h('p', { className: 'dcb-hint' }, 'ownWindow' in state ? t('ownWindowHint') : t('ownWindowOld'))),
+          h(Toggle, { label: t('ownWindow'), checked: state.ownWindow !== false && 'ownWindow' in state, disabled: !can || !('ownWindow' in state), onChange: (on) => run({ action: 'window', on }) }))) : null
+
+      const notes = [
+        error ? { tone: 'err', text: fmt(t('stale'), { error, time: lastSuccess ? new Date(lastSuccess).toLocaleTimeString() : t('checking') }) } : null,
+        !stale && state && state.outdated ? { tone: 'warn', text: t('outdated') } : null,
+        note,
+      ].filter(Boolean)
+
+      return h('div', { className: 'dcb' },
+        status,
+        h('div', { className: 'dcb-security', role: 'note' }, t('privacyNotice')),
+        setup,
+        switches,
+        ...notes.map((n, i) => h('div', { key: `n${i}`, className: 'dcb-note', 'data-tone': n.tone }, n.text)),
+        h('div', { className: 'dcb-foot' },
+          !stale && state && state.plugin ? h('span', null, fmt(t('plugin'), { v: state.plugin })) : null,
+          h('a', { href: REPO, target: '_blank', rel: 'noopener noreferrer' }, t('guide'))))
+    }
+
+    function makeCard(boundT) {
+        return function ChromeSuiteCard(props) {
+          const t = typeof props.t === 'function' ? props.t : boundT
+        return props.view === 'summary' ? h(Summary, { t }) : h(Page, { t })
+      }
+    }
+
+    function apply(ctx) {
+      const t = ctx.locale && typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : (k) => zh[k] || k
+      if (ctx.locale && typeof ctx.locale.register === 'function') {
+        ctx.effect(() => ctx.locale.register(NS, { zh, en, ru }), 'dsh-chrome-suite: dictionaries')
+      }
+      const Card = makeCard(t)
+      const mount = (name, key) => {
+        const reg = () => ctx.slots.register({ name, key, locale: NS }, Card)
+        ctx.effect(() => (typeof ctx.slots.inject === 'function' ? ctx.slots.inject(name, reg) : reg()), `dsh-chrome-suite: ${name}`)
+      }
+      mount('plugins.bundle.config', PKG)
+      mount('plugins.row.config', `${PKG}#${ROW}`)
+    }
+
+    exports.apply = apply
+    exports.inject = ['slots', 'locale']
+    return module.exports
+  },
+})

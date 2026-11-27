@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Chrome 浏览器套件",
+    "description": "统一的 Chrome 页面读取、操作、截图、标签页与 DevTools 工具，带连接诊断、暂停开关和动作白名单。",
+    "detail": "README.md"
+  }
+}

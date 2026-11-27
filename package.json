@@ -1,0 +1,65 @@
+{
+  "name": "dsh-chrome-suite",
+  "version": "1.3.0",
+  "description": "Unofficial fork: unified DSH browser tools for Chrome (page reading, actions, screenshots, tabs, DevTools) with connection diagnostics, pause control and configurable action allowlists. Based on dsh-chrome-bridge (MIT).",
+  "type": "module",
+  "license": "MIT",
+  "author": "meng; based on dsh-chrome-bridge by OrderG-X",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "browser",
+    "chrome",
+    "cdp",
+    "chrome-devtools-protocol",
+    "native-messaging",
+    "browser-automation",
+    "agent"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "actions.js",
+    "tabs.js",
+    "setup.js",
+    "image-guard.js",
+    "refs.js",
+    "devtools.js",
+    "nav.js",
+    "drag.js",
+    "download.js",
+    "panel.js",
+    "cordis.patch.yml",
+    "client.js",
+    "locale",
+    "i18n",
+    "README.md",
+    "README.en.md",
+    "NOTICE",
+    "LICENSE",
+    "icon.svg",
+    "vendor",
+    "package.json"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  }
+}

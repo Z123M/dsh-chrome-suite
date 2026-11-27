@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Chrome 浏览器套件",
-    "description": "统一的 Chrome 页面读取、操作、截图、标签页与 DevTools 工具，带连接诊断、暂停开关和动作白名单。",
+    "title": "DSH Chrome 工具套件",
+    "description": "让 DSH 用你已登录的 Chrome 干活：页面快照、点击输入、截图、标签页、下载与 DevTools，带暂停开关、动作白名单和可清空的记录。",
     "detail": "README.md"
   }
 }

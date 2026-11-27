@@ -16,7 +16,7 @@ Repository: https://github.com/Z123M/dsh-chrome-suite
 | `browser_tabs` | List, find, open, close, activate tabs |
 | `browser_read` | Structured snapshot (with element numbers), visible text, HTML, one attribute, page info |
 | `browser_click` | Real mouse click by ref, selector, text or coordinates; double-click |
-| `browser_input` | Type, keys and chords, select, upload, focus, hover, scroll |
+| `browser_input` | Type, keys and chords, select, upload (session working directory or system temp only, no hidden files), focus, hover, scroll |
 | `browser_nav` | Go, back, forward, reload |
 | `browser_screenshot` | Viewport, full page, single element |
 | `browser_eval` | Run JS in the page and get the result back |
@@ -133,8 +133,9 @@ is a diagnostic tool that reads no page content.
 
 ## Languages
 
-Tool descriptions, parameter docs and error messages support `zh` / `en` / `ru` via `config.locale`
-(unknown values fall back to `zh`). The settings card ships `zh` and `en`.
+Tool descriptions, parameter docs and error messages shown to the model support `zh` / `en` / `ru` via
+`config.locale` (unknown values fall back to `zh`). The DSH settings card follows DSH's UI language and the
+Chrome popup follows Chrome's; both ship Chinese, English and Russian.
 
 ## Development
 

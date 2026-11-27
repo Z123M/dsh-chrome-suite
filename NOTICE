@@ -24,7 +24,7 @@ installer in `setup.js`.
   `DSH_CHROME_USE_ALLOWED_ACTIONS`) enforced before every tool executes.
 - Replaces the settings card's dynamic import of DSH client UI primitives with self-contained
   controls, and marks a stale status when polling fails instead of showing an old "connected".
-- Renames the bundled Chrome extension's display name to "Chrome Suite Bridge" (version 1.15.4) so it
+- Renames the bundled Chrome extension's display name to "Chrome Suite Bridge" (version 1.15.5) so it
   is distinguishable from other installed copies, and adds an in-panel privacy notice.
 - Gives the package its own transport identity: host name `com.chromesuite.bridge`, install locations
   `~/.dsh/chrome-suite-bridge` and `~/chrome-suite-bridge-extension`, socket/token/log files under
@@ -41,7 +41,8 @@ installer in `setup.js`.
 - Adds records control: a popup button that clears the activity ledger, session ledger and log, a
   "record action details" switch that drops hints, tab titles and error text, and 24-hour caps on
   both the activity ledger and the log. Both controls are reachable only from the toolbar popup. The
-  "release all" button now explains why it is disabled while no tab is attached.
+  bulk-release button is renamed to "release all tabs" and explains why it is disabled while no tab
+  is attached.
 
 ## Not changed
 

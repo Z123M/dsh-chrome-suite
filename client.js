@@ -1,7 +1,7 @@
 /**
  * dsh-chrome-suite 的网页端：DSH「插件」页里我们这张卡的设置页。
  *
- *   连接状态（扩展 / 本机程序、版本、正在控制哪些标签页）+ 全部放开；文字有中 / 英 / 俄三份，跟着 DSH 的界面语言
+ *   连接状态（扩展 / 本机程序、版本、正在控制哪些标签页）+ 释放全部标签页；文字有中 / 英 / 俄三份，跟着 DSH 的界面语言
  *   三个开关：允许 DSH 控制浏览器（这里只能关）、页面里显示 DSH 光标、新页开在单独窗口
  *   没连上时：差哪一步、一键帮你打开安装页
  *
@@ -50,8 +50,8 @@ window.__ModuleLoader__.load({
       localBuild: '本地版',
       controlling: '正在控制 %n 个标签页',
       controllingIdle: '没有在控制的标签页',
-      releaseAll: '全部放开',
-      released: '已全部放开',
+      releaseAll: '释放全部标签页',
+      released: '已释放全部标签页',
       allowControl: '允许 DSH 控制浏览器',
       allowControlHint: '关掉后，DSH 碰不了浏览器。要重新打开，得去 Chrome 工具栏点 Chrome Suite Bridge 图标——DSH 自己打不开。',
       resumeInChrome: '要恢复：点 Chrome 工具栏上的 Chrome Suite Bridge 图标，在里面把控制重新打开。',
@@ -98,7 +98,7 @@ window.__ModuleLoader__.load({
       localBuild: 'Local',
       controlling: 'Controlling %n tab(s)',
       controllingIdle: 'No tabs under control',
-      releaseAll: 'Release all',
+      releaseAll: 'Release all tabs',
       released: 'Released all tabs',
       allowControl: 'Allow DSH to control the browser',
       allowControlHint: 'When off, DSH can\'t touch the browser. To turn it back on, click the Chrome Suite Bridge icon in Chrome\'s toolbar; DSH can\'t do that itself.',
@@ -147,7 +147,7 @@ window.__ModuleLoader__.load({
       localBuild: 'Локальная',
       controlling: 'Вкладок под управлением: %n',
       controllingIdle: 'Вкладок под управлением нет',
-      releaseAll: 'Отпустить все',
+      releaseAll: 'Отпустить все вкладки',
       released: 'Все вкладки отпущены',
       allowControl: 'Разрешить DSH управлять браузером',
       allowControlHint: 'Выкл.: DSH не может трогать браузер. Включить обратно можно только через значок Chrome Suite Bridge на панели инструментов Chrome — сам DSH этого сделать не может.',

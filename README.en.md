@@ -1,19 +1,89 @@
-# Chrome browser suite
+# DSH Chrome Tool Suite
 
-> **Unofficial fork.** This package is derived from [OrderG-X's dsh-chrome-bridge](https://github.com/OrderG-X/dsh-chrome-bridge) (MIT). It is not affiliated with or endorsed by that project or by DeepSeek Harness. The bundled Chrome extension is renamed to **Chrome Suite Bridge**, but the native host name `com.dsh.bridge` and the extension identity are shared with upstream, so it **must not be enabled together with the upstream plugin**. See [NOTICE](/Users/yp-21006/Desktop/dsh-chrome-suite/NOTICE) for provenance, changes and licensing.
+Chrome browser tools for DeepSeek Harness: read pages, click elements, take screenshots, manage tabs,
+inspect Console and Network. It goes through a Chrome extension and Native Messaging to drive the
+**Chrome you are already signed in to** — no separate profile, no debug port.
 
-Unified DSH tools for Chrome: structured page snapshots and text, real clicks and input, navigation, screenshots, tab management, downloads, and DevTools Console/Network inspection. Connection status, controlled tabs, recent actions, pause and release controls are available in the Chrome extension popup and DSH plugin settings card.
+Repository: https://github.com/Z123M/dsh-chrome-suite
 
+## What it is
 
-## Permissions and connection
+13 resident `browser_*` tools for the model:
 
-The plugin connects through Chrome Native Messaging and CDP; it does not open a TCP listening port. Install the **Chrome Suite Bridge** extension in Chrome (the bundled copy, loaded unpacked). This fork ships its own extension ID, and its host accepts only the bundled extension, so the upstream store copy cannot connect to it. The extension uses Chrome's `debugger` permission and `<all_urls>`, so when connected it can read and operate ordinary Chrome pages, including signed-in sites. It does not control the DSH desktop application's own window.
+| Tool | What it does |
+|---|---|
+| `browser_status` | Host, extension, pause state, controlled tab count; reads no page content |
+| `browser_tabs` | List, find, open, close, activate tabs |
+| `browser_read` | Structured snapshot (with element numbers), visible text, HTML, one attribute, page info |
+| `browser_click` | Real mouse click by ref, selector, text or coordinates; double-click |
+| `browser_input` | Type, keys and chords, select, upload, focus, hover, scroll |
+| `browser_nav` | Go, back, forward, reload |
+| `browser_screenshot` | Viewport, full page, single element |
+| `browser_eval` | Run JS in the page and get the result back |
+| `browser_wait` | Wait for an element, text, or URL — or for it to go away |
+| `browser_dialog` | Handle alert / confirm / prompt |
+| `browser_drag` | Reorder lists, sliders, drag files into a drop zone |
+| `browser_download` | Download a link target with the browser's signed-in state |
+| `browser_devtools` | Console, uncaught JS errors, Network requests and response bodies, clear records |
 
-The transport follows dsh-chrome-bridge, but the identity is independent: the native host is `com.chromesuite.bridge`, installed at `~/.dsh/chrome-suite-bridge` (under the user's DSH directory on Windows), with the extension copy at `~/chrome-suite-bridge-extension` and an extension ID derived from this package's own public key. Installing this suite therefore does not overwrite the upstream bridge; running both is still discouraged because they attach a debugger to the same Chrome.
+A sibling CLI `cb` shares the same host for multi-step, batched, scripted and scheduled work, which
+uses fewer tokens than one tool call per step. Permissions, host and extension are the same for both
+entries; only the calling surface differs.
 
-The extension's “Allow DSH to control the browser” switch is a human-operated pause control. DSH can pause and release tabs, but cannot re-enable browser control itself. New tabs open in a separate Chrome window by default. The plugin does not target the current page implicitly; specify `tab: "active"` to operate the currently active tab. Page text, screenshots, Console output, Network responses and other tool results enter the current DSH session and may be sent with the conversation to your configured model service; do not ask the model to read passwords, payment details or other sensitive page content.
+## Install
 
-All actions are enabled by default, as selected for this setup. Restrict them in the profile's `cordis.patch.yml`. The setting accepts `*` or comma-separated action names and is compatible with `DSH_CHROME_USE_ALLOWED_ACTIONS`. An explicit config value takes precedence over the environment variable; an explicitly empty allowlist denies all actions.
+```bash
+git clone https://github.com/Z123M/dsh-chrome-suite.git
+```
+
+1. In DSH open **Plugins** > **Add plugin**, pick the local directory `dsh-chrome-suite`, then restart DSH.
+2. Install the extension: the settings card opens `chrome://extensions` and copies the path. Enable
+   Developer mode, click **Load unpacked**, choose `~/chrome-suite-bridge-extension`.
+3. Once connected, the card shows the host, extension version and controlled tab count.
+
+The extension uses Chrome's `debugger` permission and `<all_urls>`, so it can read and act on ordinary
+Chrome pages, including signed-in ones. It does not control the DSH desktop window itself.
+
+**Do not run it alongside other `browser_*` plugins.** They all attach a debugger to the same Chrome
+and register overlapping tool names; running both breaks tool lookup and tab ownership. Disable the
+other browser bridges first.
+
+## Permissions and transport
+
+- No TCP listening port: the extension and host use Chrome Native Messaging, DSH and the host use a
+  local socket (a named pipe on Windows).
+- Settings route `GET/POST /dsh-chrome-suite/panel` accepts local connections only, rejects
+  cross-site Origins, and requires JSON POST bodies.
+
+To check whether it is connected, whether the host is running, and which extension version is in use,
+just call `browser_status` — no log digging needed.
+
+## Tab targeting
+
+- **No `tab` given**: reuse the tab this session opened or named before. If this session has not used
+  one yet and the work window holds exactly one tab, use that tab — so `cb open` and
+  `browser_tabs open` share the same default target.
+- With several tabs in the work window it does not guess: it errors and lists the candidate ids.
+  Acting on the wrong tab costs more than asking for an id.
+- **Tabs in your own window are never candidates.** To act on the page you are looking at, pass
+  `tab: "active"` explicitly.
+- New tabs open in a separate work window, in the background, without stealing focus.
+
+## Pause and safety gate
+
+The "Allow DSH to control the browser" switch in the Chrome extension popup is a human gate, and
+**only you can restore it**:
+
+- From the settings card you can: pause, release all controlled tabs, toggle the in-page cursor, set
+  the new-tab window mode, and re-run the install helper.
+- Resuming control is only possible in the Chrome extension popup. The model cannot reach that path,
+  and the plugin does not expose it, so the model cannot let itself back in.
+- Pausing also detaches every attached tab. After that every action is refused until you resume.
+
+## Action allowlist
+
+Everything is allowed by default. To narrow it, edit the profile's `cordis.patch.yml` or set
+`DSH_CHROME_USE_ALLOWED_ACTIONS` (explicit config wins; an empty list denies every action):
 
 ```yaml
 - id: chrome-suite
@@ -23,45 +93,34 @@ All actions are enabled by default, as selected for this setup. Restrict them in
     allowedActions: tabs,snapshot,read,screenshot,wait,devtools
 ```
 
-Actions: `tabs`, `tab-read`, `tab-write`, `snapshot`, `read`, `click`, `input`, `nav`, `screenshot`, `eval`, `wait`, `dialog`, `drag`, `download`, `devtools`. `tabs` allows all tab operations; `tab-read` allows listing and searching tabs only; `tab-write` allows opening, closing, and switching tabs. `snapshot` controls structured snapshots, while `read` controls text, HTML, attributes, and page metadata.
+Action names: `tabs`, `tab-read`, `tab-write`, `snapshot`, `read`, `click`, `input`, `nav`,
+`screenshot`, `eval`, `wait`, `dialog`, `drag`, `download`, `devtools`.
+`tab-read` allows listing and finding only; `tab-write` allows open/close/activate; `snapshot`
+controls the structured snapshot separately. `browser_status` is exempt from the allowlist because it
+is a diagnostic tool that reads no page content.
 
-## Tools
+## Design trade-offs
 
-The plugin also injects a short routing rule into the system prompt: use `browser_*` for ad-hoc actions, inspecting a page, or clicking an exact element; use `cb` for bulk work, loops, scripts and scheduled jobs; use `cb` when the session has no `browser_*` tools. The rule shapes the model's choice only; both entry points share one host and one permission set.
+- **Borrow the Chrome you already use**: no new profile, no login import — nearly everything worth
+  doing lives in pages you are already signed in to.
+- **No debug port**: Native Messaging plus in-extension CDP, so nothing listens on TCP; the cost is
+  that you have to install the extension.
+- **13 resident tools**: the model does not have to look up the tool list first; the cost is a little
+  context spent on tool descriptions.
+- **Conservative default target**: erroring and asking for a tab id beats guessing, because acting on
+  the wrong page costs far more than typing one id.
 
-- `browser_status`: inspect the local host, Chrome extension, pause state and controlled tab count without reading page content; this diagnostic is not subject to the action allowlist.
-- `browser_tabs`: list, find, open, close, and switch tabs.
-- `browser_read`: structured snapshots, text, HTML, attributes, and page information.
-- `browser_click`, `browser_input`, `browser_nav`: click, type, form actions, scrolling, and navigation.
-- `browser_screenshot`, `browser_wait`, `browser_drag`: screenshots, page-condition waits, and drag operations.
-- `browser_eval`, `browser_dialog`: run page JavaScript and handle alert/confirm/prompt dialogs.
-- `browser_download`: download files from pages.
-- `browser_devtools`: console output, uncaught JS errors, network requests, response bodies, and clearing diagnostic records.
+## Languages
 
-## Install
+Tool descriptions, parameter docs and error messages support `zh` / `en` / `ru` via `config.locale`
+(unknown values fall back to `zh`). The settings card ships `zh` and `en`.
 
-In DSH, open **Plugins** > **Add plugin** and select the local directory `dsh-chrome-suite`; restart DSH after installation. The default path uses the bundled extension: open `chrome://extensions`, enable Developer mode, click **Load unpacked**, and choose `~/chrome-suite-bridge-extension` (the settings card opens the page and copies the path for you). The upstream store copy is a different package and cannot reach this host. The card reports host and extension status and controlled tabs.
+## Development
 
-**Enabling `dsh-chrome-bridge`, `dsh-chrome-use`, or `@shallbay/dsh-bridge-browser` at the same time is not recommended.** This package now has its own host name and extension ID, so installations no longer overwrite each other, but every bridge attaches a debugger to the same Chrome and registers overlapping `browser_*` tools. Disable the other bridges before using this one.
+```bash
+node --test actions.test.js tabs.test.js
+```
 
-## Difference from other browser plugins
+## License
 
-This suite targets "borrow the Chrome you already use" and ships no watch panel. Compared with `dsh-browser-cdp` 1.15.1 (README/registry facts only, not run on this machine):
-
-| Capability | This suite | dsh-browser-cdp |
-|---|---|---|
-| Drive the signed-in Chrome window you already use | Yes, extension + Native Messaging, no extra profile | Needs Chrome started with a debug port, or its managed runtime |
-| Listening network port | None (private native messaging pipe) | Local CDP debug port |
-| Visible in-page cursor captured in screenshots | Yes | No, uses a watch panel instead |
-| Console / uncaught JS errors / response bodies | Dedicated `browser_devtools` | Via raw `bcdp_cdp` or `bcdp_script` |
-| Pause gate the model cannot re-enable | Yes, restored only in the Chrome extension popup | No equivalent |
-| Live watch panel, takeover, element picking | No | Yes |
-| Login import, captcha detection, task spaces | No | Yes |
-| Tool schema cost | 13 resident tools | Lazy tiers, 1 resident by default |
-| Install size | Light, no bundled browser | Bundles a managed Chromium runtime |
-
-Choose dsh-browser-cdp for a dedicated, watchable, takeover-able agent browser; choose this suite to act directly in your own signed-in Chrome without opening a debug port.
-
-## Provenance and compatibility
-
-This package uses [dsh-chrome-bridge](https://github.com/OrderG-X/dsh-chrome-bridge) 1.20.0 (MIT) as its transport and browser-tool base, adding a configurable action allowlist and consolidated documentation. It does not copy the other packages' WebSocket/pairing transports, which would compete for the same browser. The cached metadata for `dsh-chrome-use` 0.16.1 declares DSH `>=0.2.1-rc.2`; the upstream base claims Chrome 116+ and macOS/Windows/Linux support. Installation and live Chrome pairing have not been verified on this machine.
+MIT, see [LICENSE](LICENSE). Third-party code and changes are documented in [NOTICE](NOTICE).

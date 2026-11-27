@@ -1,7 +1,7 @@
 {
   "name": "dsh-chrome-suite",
-  "version": "1.3.0",
-  "description": "Unofficial fork: unified DSH browser tools for Chrome (page reading, actions, screenshots, tabs, DevTools) with connection diagnostics, pause control and configurable action allowlists. Based on dsh-chrome-bridge (MIT).",
+  "version": "1.3.1",
+  "description": "Chrome browser tools for DeepSeek Harness: page snapshots, real clicks and typing, screenshots, tab control, downloads and DevTools Console/Network, with a pause gate and configurable action allowlists.",
   "type": "module",
   "license": "MIT",
   "author": "meng; based on dsh-chrome-bridge by OrderG-X",

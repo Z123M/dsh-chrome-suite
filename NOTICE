@@ -1,20 +1,21 @@
 # NOTICE
 
-`dsh-chrome-suite` is an unofficial fork. It is not affiliated with, endorsed by, or published by
-the authors of DeepSeek Harness, of `dsh-chrome-bridge`, or of the DSH Bridge Chrome extension.
+## Third-party code
 
-## Upstream work this package is derived from
+This package includes code originally published by OrderG-X:
 
 - Project: `dsh-chrome-bridge` 1.20.0 — https://github.com/OrderG-X/dsh-chrome-bridge
 - Copyright (c) 2026 OrderG-X
 - License: MIT (full text in `LICENSE`)
-- Derived portions: the Native Messaging host, the bundled Chrome extension, the CDP operations
-  behind the `browser_*` tools, the settings-panel route, and the installer in `setup.js`.
 
-The MIT license permits modification and redistribution provided the original copyright notice and
-permission notice are retained. Both are present in `LICENSE`.
+The MIT license requires the copyright and permission notice to be retained in copies and substantial
+portions of the software. That notice is in `LICENSE` and is unmodified.
 
-## What this fork changes
+Portions of this package that come from that code: the Native Messaging host, the bundled Chrome
+extension, the CDP operations behind the `browser_*` tools, the settings-panel route, and the
+installer in `setup.js`.
+
+## Changes in this package
 
 - Package identity: `dsh-chrome-suite`, plugin row `chrome-suite`, settings route
   `/dsh-chrome-suite/panel`, locale namespace `dsh-chrome-suite`.
@@ -24,31 +25,39 @@ permission notice are retained. Both are present in `LICENSE`.
 - Replaces the settings card's dynamic import of DSH client UI primitives with self-contained
   controls, and marks a stale status when polling fails instead of showing an old "connected".
 - Renames the bundled Chrome extension's display name to "Chrome Suite Bridge" (version 1.15.1) so it
-  is distinguishable from the upstream store copy, and adds an in-panel privacy notice.
-- Gives the fork its own transport identity: host name `com.chromesuite.bridge`, install locations
+  is distinguishable from other installed copies, and adds an in-panel privacy notice.
+- Gives the package its own transport identity: host name `com.chromesuite.bridge`, install locations
   `~/.dsh/chrome-suite-bridge` and `~/chrome-suite-bridge-extension`, socket/token/log files under
-  `/tmp/chrome-suite-bridge-<uid>/`, and a manifest `key` generated for this fork. The upstream store
-  extension ID is no longer allowed to reach this host.
-- Removes the upstream "nudge the legacy host" path, which would have sent a reload to the upstream
-  host on a machine where both are installed.
+  `/tmp/chrome-suite-bridge-<uid>/`, and a manifest `key` generated for this package. No other
+  extension ID is allowed to reach this host.
+- Removes the upstream "nudge the legacy host" path, which would have sent a reload to another
+  installed host.
 - Host names must match Chrome's grammar `[a-z0-9_]+(\.[a-z0-9_]+)*`: hyphens are rejected with
-  "Invalid native messaging host name specified", so this fork uses `com.chromesuite.bridge`.
-- Consolidates the Chinese and English documentation and adds a comparison with `dsh-browser-cdp`.
+  "Invalid native messaging host name specified", hence `com.chromesuite.bridge`.
+- Fixes the 1.2.0 bug where every tool failed with `undefined` reading `has` because the action
+  allowlist was not passed to the check.
+- Resolves an omitted `tab` to a tab in the DSH work window when this session has not used one yet,
+  so the plugin tools and the `cb` CLI share a default target.
 
-## What this fork deliberately does not change
+## Not changed
 
 - The CDP operation set, the native-messaging wire protocol, and the in-page cursor behaviour.
 
-Because the transport identity is separate, installing this fork does not overwrite the upstream
-bridge, and the two extension IDs are distinct. Running both plugin rows at the same time is still
-not recommended: each attaches a debugger to the same Chrome tabs and registers overlapping
-`browser_*` tools.
+Because the transport identity is separate, installing this package does not overwrite another
+installation, and the extension IDs are distinct. Running two `browser_*` plugins at the same time is
+still not recommended: each attaches a debugger to the same Chrome tabs and registers overlapping
+tool names.
 
 ## Assets
 
-`icon.svg` in this package was drawn for this fork. Icons and images under `vendor/extension/icons`
-are upstream assets redistributed with the MIT-licensed code; the upstream project does not state a
+`icon.svg` in this package was drawn for this package. Icons and images under `vendor/extension/icons`
+are third-party assets redistributed with the MIT-licensed code; the original project does not state a
 separate license for them.
+
+## Not affiliated
+
+This package is not affiliated with, endorsed by, or published by the authors of DeepSeek Harness or
+of the project listed above.
 
 ## Trademarks
 

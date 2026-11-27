@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome-suite",
-  "version": "1.4.0",
+  "version": "1.3.0",
   "description": "Chrome browser tools for DeepSeek Harness: page snapshots, real clicks and typing, screenshots, tab control, downloads and DevTools Console/Network, with a pause gate and configurable action allowlists.",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
     "setup.js",
     "image-guard.js",
     "refs.js",
+    "extract.js",
     "devtools.js",
     "nav.js",
     "drag.js",

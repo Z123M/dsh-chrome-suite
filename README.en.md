@@ -24,6 +24,10 @@ Repository: https://github.com/Z123M/dsh-chrome-suite
 | `browser_dialog` | Handle alert / confirm / prompt |
 | `browser_drag` | Reorder lists, sliders, drag files into a drop zone |
 | `browser_download` | Download a link target with the browser's signed-in state |
+| `browser_find` | Locate elements by visible text or selector; refs match the snapshot and work in click/input |
+| `browser_scrape` | Extract tables, lists and cards one selector per row into structured JSON rows |
+| `browser_assert` | Assert page state (text, selector, count, value, URL, title), failing with the actual value |
+| `browser_wait_response` | Wait for a specific network response, optionally with its body, instead of sleeping |
 | `browser_devtools` | Console, uncaught JS errors, Network requests and response bodies, clear records |
 
 A sibling CLI `cb` shares the same host for multi-step, batched, scripted and scheduled work, which

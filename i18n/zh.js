@@ -317,6 +317,55 @@ export default {
   'setup.pasteWin': '把路径粘进文件框顶上的地址栏、回车',
   'setup.pasteLinux': '在文件框里按 Ctrl+L、粘贴、回车',
   'res.read.truncated': '\n…（截断，全文 %n 字）',
+  // ── browser_find ───────────────────────────────────────────────────────
+  'tool.find.desc': '在页面里按可见文字或 CSS 选择器找元素，返回带编号 [N] 的结果。比整页 snapshot 省上下文：先找再点。find 复用快照的编号，所以返回的 ref 可以直接传给 browser_click / browser_input。第一次调用会先跑一遍整页快照，所以比后续调用慢一点。',
+  'tool.find.query': '要匹配的可见文字片段（不区分大小写）；与 selector 至少给一个',
+  'tool.find.selector': 'CSS 选择器；只返回命中它的元素',
+  'tool.find.limit': '最多返回几条，默认 20，上限 100',
+
+  // ── browser_scrape ─────────────────────────────────────────────────────
+  'tool.scrape.desc': '按「一行一个选择器」抓取重复结构：表格、列表、卡片。给 item（每一行的选择器）和 fields（字段名→选择器），直接拿回结构化 JSON 行，不用整页文字再自己解析。',
+  'tool.scrape.item': '每一行的 CSS 选择器；省略则把整页当成一行',
+  'tool.scrape.fields': '字段映射：{ 字段名: "CSS 选择器" } 或 { 字段名: { selector: "CSS 选择器", attr: "href" } }。不给 attr 取可见文字，给了取该属性',
+  'tool.scrape.limit': '最多几行，默认 50，上限 200',
+
+  // ── browser_assert ─────────────────────────────────────────────────────
+  'tool.assert.desc': '断言页面状态，用来确认「点完真的成功了」，而不是靠截图猜。支持：text（页面文字包含）、selector（元素存在）、count（元素数量等于）、value（元素值等于）、url（网址包含）、title（标题包含）。断言失败会返回错误并附上实际值，模型据此决定继续还是停。',
+  'tool.assert.kind': '断言类型',
+  'tool.assert.selector': 'selector / count / value 时的目标选择器',
+  'tool.assert.value': '期望值；count 时是期望数量',
+
+  // ── browser_wait_response ──────────────────────────────────────────────
+  'tool.waitResponse.desc': '等某个网络响应出现，比「点完 sleep 两秒」靠谱：提交表单、搜索、翻页之后要确认接口回来了就用它。命中后返回方法、状态码、URL 和耗时，需要时连响应体一起取。网络记录只包含调试器接上之后的请求，所以提交前最好已经操作过这个标签页。',
+  'tool.waitResponse.url': '要匹配的 URL 子串（必填，避免匹配到任意请求）',
+  'tool.waitResponse.method': '期望方法，例如 POST',
+  'tool.waitResponse.status': '期望状态码，例如 200',
+  'tool.waitResponse.reload': '先刷新一次页面再抓（提交后需要整页重载时用）',
+  'tool.waitResponse.body': '命中后连响应体一起取回（默认只回状态行）',
+  'tool.waitResponse.timeoutMs': '超时毫秒，默认 15000，最多 %max',
+
+  // ── 新工具的结果与错误 ─────────────────────────────────────────────────
+  'res.find.head': '找到 %n 个元素（共 %total 个匹配「%q」）：',
+  'res.find.hidden': '（不可见）',
+  'res.find.tail': '用 browser_click(ref=N) 或 browser_input(ref=N) 操作它们；编号失效时重新 find。',
+  'res.scrape.head': '从 %item 抓到 %n 行（共 %total 行）：',
+  'res.scrape.empty': '%item 没有匹配到任何行：检查 item 选择器，或者先用 browser_read what=snapshot 看看页面结构。',
+  'res.scrape.tail': '行内字段是可见文字或指定属性；字段为 null 表示那一行里没有匹配到该选择器。',
+  'res.assert.pass': '断言通过（%kind %value）：实际值「%actual」',
+  'res.assert.fail': '断言失败（%kind %value）：实际值「%actual」',
+  'res.waitResponse.hit': '等到响应：%method %status %url（%ms ms）',
+  'res.waitResponse.noBody': '（拿不到响应体：%e）',
+  'err.findNeedsOne': 'query（文字）和 selector（选择器）至少给一个',
+  'err.findNone': '没找到匹配「%q」的元素：换个说法，或先用 browser_read what=snapshot 看整页',
+  'err.scrapeNeedsFields': 'fields 要给出至少一个字段，例如 { "标题": "h3", "链接": { "selector": "a", "attr": "href" } }',
+  'err.scrapeBadField': '字段「%name」写法不对：给选择器字符串，或 { selector, attr }',
+  'err.scrapeBadItem': 'item 选择器不合法：%item',
+  'err.assertBadKind': '不认识的断言类型：%kind',
+  'err.assertNeedsSelector': '这个断言需要 selector',
+  'err.assertNeedsValue': '这个断言需要 value',
+  'err.waitResponseNeedsUrl': 'wait_response 需要 url（子串）',
+  'err.waitResponseTimeout': '等了 %ms，没有出现 URL 含「%url」的响应：确认请求真的发出去了，或者用 browser_devtools network 看看实际请求',
+
   'err.setupProcList': '列进程没有跑完',
   'err.chromeNotFound': '找不到 Chrome',
 }

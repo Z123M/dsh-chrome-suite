@@ -103,3 +103,45 @@ export async function clearLogs(call, tabId) {
   await call('network', { tabId, clear: true })
   return tt('res.devtools.cleared')
 }
+
+/**
+ * 等某个网络响应出现 —— 比「点完 sleep 两秒再看」靠谱，尤其是提交表单、搜索、翻页之后。
+ * 网络记录在扩展的环形缓冲里，这里轮询比对；只在第一轮按需 reload，避免把页面刷成循环。
+ * @param call - socket 调用
+ * @param tabId - 标签页
+ * @param options.url - URL 子串（必填，避免匹配到任意请求）
+ * @param options.method - 方法，例如 POST
+ * @param options.status - 期望状态码
+ * @param options.timeoutMs - 超时，默认 15000
+ * @param options.reload - 先刷新一次页面再抓（提交后需要整页重载时用）
+ * @param options.body - 命中后是否连响应体一起取回
+ * @returns 给模型看的文本
+ */
+export async function waitResponse(call, tabId, { url, method, status, timeoutMs = 15000, reload = false, body = false } = {}) {
+  if (!url) throw new Error(tt('err.waitResponseNeedsUrl'))
+  const ms = Math.min(Math.max(Number(timeoutMs) || 15000, 1000), 120000)
+  await call('attach', { tabId })
+  const deadline = Date.now() + ms
+  let reloaded = !reload
+  while (Date.now() < deadline) {
+    const first = !reloaded
+    const r = await call('network', { tabId, limit: 400, reload: first, waitMs: first ? 2500 : 0 }, 30000)
+    reloaded = true
+    const hit = [...(r.items || [])].reverse().find((n) =>
+      String(n.url || '').includes(String(url))
+      && (!method || String(n.method || '').toUpperCase() === String(method).toUpperCase())
+      && (status === undefined || Number(n.status) === Number(status)))
+    if (hit) {
+      const head = tt('res.waitResponse.hit', {
+        method: hit.method || 'GET', status: hit.status ?? '?', url: String(hit.url || '').slice(0, 160),
+        ms: hit.ms ?? '?',
+      })
+      if (!body) return head
+      let payload
+      try { payload = await responseBody(call, tabId, hit.id, 4000) } catch (e) { return `${head}\n${tt('res.waitResponse.noBody', { e: e.message })}` }
+      return `${head}\n${payload}`
+    }
+    await sleep(400)
+  }
+  throw new Error(tt('err.waitResponseTimeout', { url, ms }))
+}

@@ -384,3 +384,66 @@ export async function frameTexts(call, tabId) {
   })
   return Array.isArray(r.value) ? r.value : []
 }
+
+/**
+ * 页内：快照已经把编号打在元素上了，这里只按条件筛出「有编号的那些」。
+ * 复用同一套 data-dsh-ref，所以 find 返回的 ref 能直接给 browser_click 用，
+ * 不引入第二套编号体系（否则点错元素是最难查的 bug）。
+ */
+const FIND_JS = (query, selector, limit) => `(() => {
+  const ATTR = ${JSON.stringify(ATTR)};
+  const S = window.__dshSnap || (window.__dshSnap = { next: 1, shadow: new Map() });
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const q = ${JSON.stringify(String(query || ''))}.toLowerCase();
+  const sel = ${JSON.stringify(String(selector || ''))};
+  const out = [];
+  const seen = new Set();
+  const push = (el) => {
+    const n = el.getAttribute(ATTR);
+    if (!n || seen.has(n)) return;
+    seen.add(n);
+    if (sel) { try { if (!el.matches(sel)) return } catch { return } }
+    const raw = el.type === 'password' ? '' : (el.innerText || el.value || '');
+    const text = norm(raw || el.getAttribute('aria-label') || el.getAttribute('title') || '').slice(0, 80);
+    if (q && !text.toLowerCase().includes(q)) return;
+    const r = el.getBoundingClientRect();
+    out.push({
+      ref: Number(n), tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '', name: el.getAttribute('name') || '',
+      href: (el.getAttribute('href') || '').slice(0, 120), text,
+      visible: r.width >= 1 && r.height >= 1,
+    });
+  };
+  for (const el of document.querySelectorAll('[' + ATTR + ']')) push(el);
+  for (const w of S.shadow.values()) { const el = w.deref(); if (el) push(el) }
+  return { total: out.length, items: out.slice(0, ${Number(limit)}) };
+})()`
+
+/**
+ * 按可见文字或 CSS 选择器找出带编号的元素。
+ * 先把整页快照跑一遍（这一步负责铺编号），再筛；所以第一次调用会有一次快照的开销。
+ * @param call - socket 调用
+ * @param tabId - 标签页
+ * @param options.query - 文字片段（不区分大小写），与 selector 至少给一个
+ * @param options.selector - CSS 选择器，只保留命中它的元素
+ * @param options.limit - 最多返回几条
+ * @returns 给模型看的清单文本
+ */
+export async function find(call, tabId, { query, selector, limit = 20 } = {}) {
+  if (!query && !selector) throw new Error(tt('err.findNeedsOne'))
+  await snapshot(call, tabId, {})
+  const r = await call('eval', { tabId, expression: FIND_JS(query, selector, limit), userGesture: false })
+  const v = r.value || {}
+  const items = v.items || []
+  if (!items.length) throw new Error(tt('err.findNone', { q: query || selector }))
+  const lines = items.map((i) => {
+    const attrs = `${i.type ? ` type=${i.type}` : ''}${i.name ? ` name=${i.name}` : ''}`
+    const hidden = i.visible ? '' : tt('res.find.hidden')
+    return `  [${i.ref}] <${i.tag}${attrs}>${hidden} 「${i.text}」`
+  })
+  return [
+    tt('res.find.head', { n: items.length, total: v.total, q: query || selector }),
+    ...lines,
+    tt('res.find.tail'),
+  ].join('\n')
+}

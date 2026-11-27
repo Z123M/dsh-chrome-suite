@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { assertActionAllowed, isActionAllowed, parseAllowedActions, setAllowedActions } from './actions.js'
+import { actionsFor, assertActionAllowed, isActionAllowed, parseAllowedActions, setAllowedActions } from './actions.js'
 
 test('missing allowlist leaves all actions open', () => {
   const actions = parseAllowedActions(undefined)
@@ -54,4 +54,16 @@ test('allowlist configured by apply() is used when the call site forgets to pass
 test('non-Set allowlist fails loudly instead of throwing an opaque TypeError', () => {
   assert.throws(() => isActionAllowed('browser_click', {}, null), /allowlist 未初始化/)
   assert.throws(() => isActionAllowed('browser_click', {}, ['*']), /allowlist 未初始化/)
+})
+
+test('new extraction and assertion tools map to allowlist actions', () => {
+  assert.deepEqual(actionsFor('browser_find', {}), ['find'])
+  assert.deepEqual(actionsFor('browser_scrape', {}), ['scrape'])
+  assert.deepEqual(actionsFor('browser_assert', {}), ['assert'])
+  assert.deepEqual(actionsFor('browser_wait_response', {}), ['wait'])
+  const readOnly = parseAllowedActions('snapshot,read,find,scrape')
+  assert.equal(isActionAllowed('browser_find', {}, readOnly), true)
+  assert.equal(isActionAllowed('browser_scrape', {}, readOnly), true)
+  assert.equal(isActionAllowed('browser_assert', {}, readOnly), false)
+  assert.equal(isActionAllowed('browser_wait_response', {}, readOnly), false)
 })

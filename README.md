@@ -23,6 +23,10 @@
 | `browser_dialog` | 处理 alert / confirm / prompt |
 | `browser_drag` | 拖拽排序、滑块、拖文件进框 |
 | `browser_download` | 把链接指向的文件下载到本机，带登录态 |
+| `browser_find` | 按可见文字或选择器找元素，返回与快照同一套编号，可直接用于点击/输入 |
+| `browser_scrape` | 按「一行一个选择器」抓表格/列表/卡片，返回结构化 JSON 行 |
+| `browser_assert` | 断言页面状态（文字/选择器/数量/值/网址/标题），失败时带实际值 |
+| `browser_wait_response` | 等指定网络响应出现，可连响应体一起取，替代点击后盲等 |
 | `browser_devtools` | Console、未捕获 JS 错误、Network 请求与响应体、清空记录 |
 
 另有一个同宿主的命令行 `cb`，一次调用可连做多步：批量、循环、脚本和定时任务用它更省 token。

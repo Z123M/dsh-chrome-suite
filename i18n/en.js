@@ -316,6 +316,55 @@ export default {
   'setup.pasteWin': 'paste the path into the address bar at the top of the file picker and hit Enter',
   'setup.pasteLinux': 'press Ctrl+L in the file picker, paste and hit Enter',
   'res.read.truncated': '\n…(truncated, %n characters in total)',
+  // ── browser_find ───────────────────────────────────────────────────────
+  'tool.find.desc': 'Find elements by visible text or CSS selector and return them with [N] refs. Cheaper than a full-page snapshot when you already know what you are looking for. Refs come from the same snapshot numbering, so a returned ref works directly in browser_click / browser_input. The first call also takes a full snapshot, so it is slower than later ones.',
+  'tool.find.query': 'Visible-text fragment to match (case-insensitive); give this or selector',
+  'tool.find.selector': 'CSS selector; only elements matching it are returned',
+  'tool.find.limit': 'Maximum results; default 20, maximum 100',
+
+  // ── browser_scrape ─────────────────────────────────────────────────────
+  'tool.scrape.desc': 'Extract repeated structure (tables, lists, cards) one selector per row. Give item (the row selector) and fields (field name to selector) and get structured JSON rows back instead of parsing whole-page text yourself.',
+  'tool.scrape.item': 'CSS selector for each row; omit to treat the whole page as one row',
+  'tool.scrape.fields': 'Field map: { name: "CSS selector" } or { name: { selector: "CSS selector", attr: "href" } }. Without attr it reads visible text; with attr it reads that attribute',
+  'tool.scrape.limit': 'Maximum rows; default 50, maximum 200',
+
+  // ── browser_assert ─────────────────────────────────────────────────────
+  'tool.assert.desc': 'Assert page state to confirm an action actually succeeded instead of guessing from a screenshot. Kinds: text (page text contains), selector (element exists), count (element count equals), value (element value equals), url (URL contains), title (title contains). A failed assertion returns an error with the actual value so you can decide whether to continue or stop.',
+  'tool.assert.kind': 'Assertion kind',
+  'tool.assert.selector': 'Target selector for selector / count / value',
+  'tool.assert.value': 'Expected value; the expected count for count',
+
+  // ── browser_wait_response ──────────────────────────────────────────────
+  'tool.waitResponse.desc': 'Wait for a network response instead of sleeping after a click: use it after submitting a form, searching, or paging, to confirm the backend answered. Returns method, status, URL and timing, optionally with the response body. The network buffer only holds requests seen after the debugger attached, so act on the tab first.',
+  'tool.waitResponse.url': 'URL substring to match (required, so unrelated requests cannot match)',
+  'tool.waitResponse.method': 'Expected method, for example POST',
+  'tool.waitResponse.status': 'Expected status code, for example 200',
+  'tool.waitResponse.reload': 'Reload the page once before waiting (for full-page reload after submit)',
+  'tool.waitResponse.body': 'Also return the response body (default returns only the status line)',
+  'tool.waitResponse.timeoutMs': 'Timeout in milliseconds; default 15000, max %max',
+
+  // ── results and errors for the new tools ───────────────────────────────
+  'res.find.head': 'Found %n elements (%total matched "%q"):',
+  'res.find.hidden': ' (not visible)',
+  'res.find.tail': 'Act on them with browser_click(ref=N) or browser_input(ref=N); re-run find if a ref goes stale.',
+  'res.scrape.head': 'Scraped %n rows from %item (%total matched):',
+  'res.scrape.empty': '%item matched no rows: check the item selector, or inspect the page with browser_read what=snapshot first.',
+  'res.scrape.tail': 'Each field is visible text or the named attribute; null means that row had no match for the selector.',
+  'res.assert.pass': 'Assertion passed (%kind %value): actual "%actual"',
+  'res.assert.fail': 'Assertion failed (%kind %value): actual "%actual"',
+  'res.waitResponse.hit': 'Response seen: %method %status %url (%ms ms)',
+  'res.waitResponse.noBody': ' (no response body available: %e)',
+  'err.findNeedsOne': 'Give at least one of query (text) or selector (CSS)',
+  'err.findNone': 'No element matched "%q": rephrase, or inspect the page with browser_read what=snapshot',
+  'err.scrapeNeedsFields': 'fields needs at least one entry, for example { "title": "h3", "link": { "selector": "a", "attr": "href" } }',
+  'err.scrapeBadField': 'Field "%name" is malformed: give a selector string, or { selector, attr }',
+  'err.scrapeBadItem': 'Invalid item selector: %item',
+  'err.assertBadKind': 'Unknown assertion kind: %kind',
+  'err.assertNeedsSelector': 'This assertion needs a selector',
+  'err.assertNeedsValue': 'This assertion needs a value',
+  'err.waitResponseNeedsUrl': 'wait_response needs url (a substring)',
+  'err.waitResponseTimeout': 'Waited %ms and no response URL containing "%url" appeared: confirm the request was sent, or inspect it with browser_devtools network',
+
   'err.setupProcList': 'the process listing did not finish',
   'err.chromeNotFound': 'Chrome not found',
 }

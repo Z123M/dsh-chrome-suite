@@ -18,8 +18,9 @@ import { fileURLToPath } from 'node:url'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { installImageGuard } from './image-guard.js'
 import { ensureInstalled, installHint, assistInstall, paths, extensionId, hostProbe } from './setup.js'
-import { snapshot, locate, focusShadow, elementBox, selectInPage, frameTexts } from './refs.js'
-import { consoleLog, networkLog, responseBody, clearLogs } from './devtools.js'
+import { snapshot, locate, focusShadow, elementBox, selectInPage, frameTexts, find } from './refs.js'
+import { consoleLog, networkLog, responseBody, clearLogs, waitResponse } from './devtools.js'
+import { scrape, assertPage } from './extract.js'
 import { historyNav, waitUntil } from './nav.js'
 import { PANEL_ROUTE, panelHandler } from './panel.js'
 import { drag } from './drag.js'
@@ -1118,6 +1119,97 @@ export function apply(ctx, config) {
           timeoutMs,
         })
         return { text }
+      },
+    }),
+
+    // ── 查找 / 提取 / 断言 / 等响应 ─────────────────────────────────────────
+    defineTool({
+      name: 'browser_find',
+      description: t('tool.find.desc'),
+      parameters: {
+        query: { type: 'string', description: t('tool.find.query') },
+        selector: { type: 'string', description: t('tool.find.selector') },
+        limit: { type: 'integer', description: t('tool.find.limit') },
+        tab: { type: 'string', description: TAB },
+      },
+      output: textOutput,
+      presentCall: present('Browser find'),
+      async execute(args) {
+        const tabId = await resolveTab(args.tab)
+        const limit = Math.min(Math.max(Number(args.limit || 20), 1), 100)
+        return { text: await find(call, tabId, { query: args.query, selector: args.selector, limit }) }
+      },
+    }),
+
+    defineTool({
+      name: 'browser_scrape',
+      description: t('tool.scrape.desc'),
+      parameters: {
+        item: { type: 'string', description: t('tool.scrape.item') },
+        fields: { type: 'object', required: true, description: t('tool.scrape.fields') },
+        limit: { type: 'integer', description: t('tool.scrape.limit') },
+        tab: { type: 'string', description: TAB },
+      },
+      output: textOutput,
+      presentCall: present('Browser scrape'),
+      async execute(args) {
+        const tabId = await resolveTab(args.tab)
+        const limit = Math.min(Math.max(Number(args.limit || 50), 1), 200)
+        return scrape(call, tabId, { item: args.item, fields: args.fields, limit })
+      },
+    }),
+
+    defineTool({
+      name: 'browser_assert',
+      description: t('tool.assert.desc'),
+      parameters: {
+        kind: {
+          type: 'string',
+          required: true,
+          enum: ['text', 'selector', 'count', 'value', 'url', 'title'],
+          description: t('tool.assert.kind'),
+        },
+        selector: { type: 'string', description: t('tool.assert.selector') },
+        value: { type: 'string', description: t('tool.assert.value') },
+        tab: { type: 'string', description: TAB },
+      },
+      output: textOutput,
+      presentCall: present('Browser assert'),
+      async execute(args) {
+        const tabId = await resolveTab(args.tab)
+        const r = await assertPage(call, tabId, { kind: args.kind, selector: args.selector, value: args.value })
+        if (!r.pass) throw new Error(r.text)
+        return { text: r.text }
+      },
+    }),
+
+    defineTool({
+      name: 'browser_wait_response',
+      description: t('tool.waitResponse.desc'),
+      parameters: {
+        url: { type: 'string', required: true, description: t('tool.waitResponse.url') },
+        method: { type: 'string', description: t('tool.waitResponse.method') },
+        status: { type: 'integer', description: t('tool.waitResponse.status') },
+        reload: { type: 'boolean', description: t('tool.waitResponse.reload') },
+        body: { type: 'boolean', description: t('tool.waitResponse.body') },
+        timeoutMs: { type: 'integer', description: t('tool.waitResponse.timeoutMs', { max: WAIT_MAX_MS }) },
+        tab: { type: 'string', description: TAB },
+      },
+      output: textOutput,
+      presentCall: present('Browser wait response'),
+      async execute(args) {
+        const tabId = await resolveTab(args.tab)
+        const timeoutMs = Math.min(Number(args.timeoutMs || 15000), WAIT_MAX_MS)
+        return {
+          text: await waitResponse(call, tabId, {
+            url: args.url,
+            method: args.method,
+            status: args.status,
+            reload: !!args.reload,
+            body: !!args.body,
+            timeoutMs,
+          }),
+        }
       },
     }),
 

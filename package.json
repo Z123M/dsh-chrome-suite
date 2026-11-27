@@ -4,6 +4,14 @@
   "description": "Chrome browser tools for DeepSeek Harness: page snapshots, real clicks and typing, screenshots, tab control, downloads and DevTools Console/Network, with a pause gate and configurable action allowlists.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Z123M/dsh-chrome-suite.git"
+  },
+  "homepage": "https://github.com/Z123M/dsh-chrome-suite#readme",
+  "bugs": {
+    "url": "https://github.com/Z123M/dsh-chrome-suite/issues"
+  },
   "author": "meng; based on dsh-chrome-bridge by OrderG-X",
   "keywords": [
     "deepseek-harness",
